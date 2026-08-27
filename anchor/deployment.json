@@ -1,0 +1,32 @@
+{
+  "contract": "ExchangeAnchor",
+  "address": "0x2A4A287EC1F01b5bCb5568D2Ed0765Faf860a62b",
+  "chain_id": 84532,
+  "rpc": "https://sepolia.base.org",
+  "explorer": "https://sepolia.basescan.org",
+  "explorer_address_url": "https://sepolia.basescan.org/address/0x2A4A287EC1F01b5bCb5568D2Ed0765Faf860a62b",
+  "tx_hash": "0x26bd0b3252c8881536e5bcddca50d137429a38ad024e3ef2e8f86b7b7f0a8895",
+  "block_number": 45495043,
+  "writer": "0x6192D3FD82917eAb2864F46cb63b69bC8C6E09CE",
+  "anchor_interval_seconds": 300,
+  "solc": "0.8.26",
+  "optimizer": {
+    "enabled": true,
+    "runs": 200
+  },
+  "selectors": {
+    "anchor(uint64,bytes8,bytes32,bytes32)": "c5dfe211",
+    "anchoredAt()": "b6ae8b1c",
+    "chainHash()": "d2b5751d",
+    "count()": "06661abd",
+    "lastId()": "c1292cc3",
+    "latest()": "52bfe789",
+    "session()": "5e3568b8",
+    "stateRoot()": "9588eca2",
+    "writer()": "453a2abc"
+  },
+  "events": {
+    "Anchored(uint64,bytes8,bytes32,bytes32,uint64,uint64)": "0x846b388d9a84109263340756e41099d4945f475c34c4f401faf0850b7c6d8385"
+  },
+  "deployed_at": 1786758374
+}

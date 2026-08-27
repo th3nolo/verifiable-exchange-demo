@@ -1,0 +1,10 @@
+# Pins the Rust toolchain so every build uses the same compiler.
+# Edition 2024 requires Rust 1.85 or newer.
+[toolchain]
+channel = "1.91.1"
+# Named because a pinned channel installs the toolchain without them. A local
+# machine usually has rustfmt already and does not notice; a fresh CI runner
+# installs exactly this toolchain and then fails `cargo fmt --check` with
+# "'cargo-fmt' is not installed", which is a broken build that says nothing
+# about the code.
+components = ["rustfmt", "clippy"]

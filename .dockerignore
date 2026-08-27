@@ -1,0 +1,30 @@
+# What is not sent to the Docker daemon when this image is built.
+#
+# The Dockerfile copies named paths, so nothing here would reach the image by
+# accident today. It is listed anyway: the build context is uploaded whole, a
+# `COPY . .` added later would pick up everything in it, and a key that was
+# never in the context cannot be committed to a layer by a future edit.
+#
+# It is also most of the build time. `target/` alone is gigabytes of build
+# output that the image rebuilds from source regardless.
+
+# The anchor signing key and the sender's position cache. The key reaches the
+# container as a mounted secret at runtime, never through the image.
+.anchor/
+
+# Everything demo.sh writes: databases, logs, per-service signing keys.
+run/
+
+# Build output, rebuilt inside the image from source.
+target/
+
+# Any key or database produced anywhere else.
+*.key
+*.db
+*.db-wal
+*.db-shm
+
+.git/
+.github/
+docs/
+*.md

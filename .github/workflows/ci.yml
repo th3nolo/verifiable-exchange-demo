@@ -1,0 +1,186 @@
+# What has to hold before a change reaches exchange.th3nolo.com.
+#
+# Two languages, because the project is two programs: the exchange in Rust and
+# the anchor sender in Go. They are checked in parallel because neither builds
+# the other.
+#
+# The Go job is the one worth reading. `anchor_test.go` derives the Ethereum
+# function selector and event topic with a real Keccak and then reads
+# `services/src/anchor.rs` to check the Rust verifier holds those same bytes.
+# Rust has no Keccak in its dependency list and does not need one for two
+# constants that cannot change while the contract does not change. This test
+# is what makes that safe. A renamed event in the contract fails CI here
+# instead of turning `eth_getLogs` into an empty list that reads as "this
+# exchange never anchored".
+
+# The actions are pinned to the first major of each that runs on Node 24.
+# GitHub's runners stopped shipping Node 20 in September 2025 and now force a
+# Node 20 action onto 24 anyway, with a warning on every run. Five of ours were:
+# checkout@v4, setup-go@v5, cache@v4, and the two docker actions in the image
+# job.
+#
+# The Docker actions were found one run later than the other three, and that is
+# worth knowing. An annotation belongs to a job, and the run that named the
+# first three had its image job cancelled before it ran, so it said nothing
+# about that job at all. A job that does not finish does not tell you what is
+# wrong with it.
+#
+# The first Node 24 major of each and not the newest, because the newest of
+# some carries a change that is not about the runtime: checkout@v7 changes how
+# a fork's pull request is checked out, setup-go@v7 and cache@v6 are rewrites
+# to ESM. Nothing here needs any of that. What it needs is a runner newer than
+# 2.327.1, which is what all six majors require and what GitHub's hosted
+# runners have been on since 2025.
+
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: exchange (rust)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      # Installs the toolchain named in services/rust-toolchain.toml rather
+      # than whatever the runner ships, so CI compiles with the same compiler
+      # the Dockerfile does.
+      - name: Install Rust
+        working-directory: services
+        run: rustup show
+
+      - name: Cache cargo
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            services/target
+          key: cargo-${{ hashFiles('services/Cargo.lock') }}
+          restore-keys: cargo-
+
+      # openssl-sys links the system OpenSSL, so the headers have to be here
+      # for the same reason they are in the Dockerfile's build stage.
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Format
+        working-directory: services
+        run: cargo fmt --check
+
+      # Debug, not release: the tests run against this build, and the `image`
+      # job below proves the release image still builds and starts.
+      - name: Build
+        working-directory: services
+        run: cargo build --locked
+
+      - name: Test
+        working-directory: services
+        run: cargo test --locked
+
+  go:
+    name: anchor sender (go)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.26'
+          cache-dependency-path: anchor/go.sum
+
+      - name: Format
+        working-directory: anchor
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+
+      - name: Build
+        working-directory: anchor
+        run: go build ./...
+
+      - name: Vet
+        working-directory: anchor
+        run: go vet ./...
+
+      # Includes the cross-language check against services/src/anchor.rs.
+      - name: Test
+        working-directory: anchor
+        run: go test ./...
+
+  # Builds and exercises the release image without publishing or deploying it.
+  # Deployment authority remains in the private source repository.
+  image:
+    name: image
+    runs-on: ubuntu-24.04
+    needs: [rust, go]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+
+      # Loaded locally so the checks below run against this exact build.
+      - name: Build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          load: true
+          tags: verifiable-exchange:ci
+          # The commit goes into the binary, which serves it on `/market`. It
+          # is the same value the publish step tags the image with, so the
+          # field and the tag can be compared directly.
+          build-args: |
+            BUILD_COMMIT=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The key reaches the container as a mounted secret at runtime. If it is
+      # ever in a layer instead, that is not recoverable by deleting it later:
+      # the layer keeps it. Cheap to check on every build, so it is checked.
+      - name: No key in the image
+        run: |
+          docker run --rm --entrypoint sh verifiable-exchange:ci -c '
+            test ! -e /run/secrets/anchor_key &&
+            test ! -e /.anchor &&
+            test -x /usr/local/bin/anchor-sender &&
+            test -x /usr/local/bin/services
+          '
+
+      # An exchange with no anchor key must still start. This is the path every
+      # local run of this image takes, and it is easy to break from the
+      # deployed side without noticing.
+      #
+      # Both checks wait for the thing they are about to read, rather than for
+      # something earlier and then assuming the rest has run. `/market` answers
+      # while the entrypoint is still opening the log, and the anchor line is
+      # printed after that, so waiting on `/market` and then reading the log
+      # was a race the entrypoint won as soon as opening the log took real
+      # time. It failed on master that way.
+      - name: Starts without an anchor key
+        run: |
+          docker run -d --name nokey -e START_BOT=no -e RATE=5 verifiable-exchange:ci
+          for _ in $(seq 1 60); do
+            docker exec nokey curl -sf --max-time 1 http://127.0.0.1:3001/market >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec nokey curl -sf --max-time 2 http://127.0.0.1:3001/market >/dev/null
+          for _ in $(seq 1 60); do
+            docker logs nokey 2>&1 | grep -q "not anchoring" && break
+            sleep 1
+          done
+          docker logs nokey 2>&1 | grep -q "not anchoring" \
+            || (echo "expected the entrypoint to say it is not anchoring"; docker logs nokey; exit 1)
+          docker rm -f nokey

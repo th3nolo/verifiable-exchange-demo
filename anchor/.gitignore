@@ -1,0 +1,6 @@
+# Compiled senders. `go build` with no -o names the binary after the module's
+# last path element, which is `anchor`, so both spellings appear depending on
+# how it was built.
+anchor
+anchor-sender
+sender.log

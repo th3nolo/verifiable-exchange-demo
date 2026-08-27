@@ -1,0 +1,39 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /services
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: America/Caracas
+    # Preserve the one-root-commit publication invariant. Security alerts and
+    # security updates remain repository settings; routine version PRs do not.
+    open-pull-requests-limit: 0
+
+  - package-ecosystem: gomod
+    directory: /anchor
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: America/Caracas
+    open-pull-requests-limit: 0
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: America/Caracas
+    open-pull-requests-limit: 0
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: America/Caracas
+    open-pull-requests-limit: 0

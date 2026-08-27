@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Verifiable Exchange, a Rust matching engine you can audit</title>
+<!-- These four lines are the only thing a search engine reads about this page.
+     The order book is drawn by JavaScript after the symbols arrive from the
+     API, so a crawler sees none of it. Measured: the served HTML contains the
+     string USDC zero times. -->
+<meta name="description" content="A live limit order book and matching engine in Rust. The log is an RFC 9162 Merkle tree. The engine signs a claim about every batch it executes. Point one command at this URL and re-execute the whole history yourself.">
+<link rel="canonical" href="https://exchange.th3nolo.com/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="th3nolo">
+<meta property="og:title" content="Verifiable Exchange, a Rust matching engine you can audit">
+<meta property="og:description" content="A live limit order book and matching engine in Rust. Re-execute its whole history from one URL and check the operator did not lie.">
+<meta property="og:url" content="https://exchange.th3nolo.com/">
+<meta name="twitter:card" content="summary">
+<!-- These are byte-for-byte copies of the icons served by th3nolo.com. -->
+<link rel="icon" href="/favicon.ico" sizes="48x48" type="image/x-icon">
+<link rel="icon" href="/icon.png" sizes="512x512" type="image/png">
+<link rel="apple-touch-icon" href="/apple-icon.png" sizes="180x180" type="image/png">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header>
+  <div class="logo">Verifiable Exchange</div>
+  <div class="tabs" id="tabs"></div>
+  <div class="ticker" id="ticker"></div>
+  <button class="iv" id="explain" aria-pressed="false"
+          title="Show what each control on this page does, and the second path an order can take to the exchange.">explain</button>
+  <button class="iv" id="layout-reset" title="Put all panels back to the default size.">reset layout</button>
+</header>
+<div class="verify" id="verify"></div>
+<main>
+  <div class="panel" id="book-panel">
+    <h2>Order Book</h2>
+    <div class="col-head"><span>Price</span><span class="num">Quantity</span><span class="num">Total</span></div>
+    <div id="book">
+      <div id="asks"></div>
+      <div id="spread"></div>
+      <div id="bids"></div>
+    </div>
+  </div>
+  <div class="gut gut-col" id="gut-left" role="separator" aria-orientation="vertical" tabindex="0"
+       aria-label="Order book width" title="Drag to change the size. Double-click for the default size."></div>
+  <div id="midcol">
+    <div class="panel" id="chart-panel">
+      <!-- Both spans float right, and the first one written lands hard against
+           the right edge. `#intervals` is written first, so the interval
+           buttons keep the place they already had and the zoom controls sit to
+           their left. Measured at a 1440 px window: the intervals run 839 to
+           1071 and the zoom span 748 to 839. -->
+      <h2>Chart<span id="intervals"></span><span class="zoom" id="chart-zoom">
+        <button class="iv" id="chart-out" title="Show more candles. Keyboard: minus.">&minus;</button>
+        <button class="iv" id="chart-in" title="Show fewer candles. Keyboard: plus.">+</button>
+        <button class="iv" id="chart-now" title="Go back to the newest candle. Keyboard: End.">now</button>
+      </span></h2>
+      <div id="chart-wrap"><canvas id="chart" tabindex="0" role="img"
+           aria-label="Price candles. Drag to move in time. Scroll to zoom. Arrow keys move, plus and minus zoom, End goes to the newest candle, 0 resets."
+           title="Drag to move in time. Scroll to zoom. Double-click to reset."></canvas></div>
+    </div>
+    <div class="gut gut-row" id="gut-chart" role="separator" aria-orientation="horizontal" tabindex="0"
+         aria-label="Chart height" title="Drag to change the size. Double-click for the default size."></div>
+    <div class="panel" id="trade-panel">
+      <!-- The account and the controls that change or persist it. The line that says
+           what the key is sits in "This browser" below and is off unless
+           `explain` is on; these buttons change the account itself, so they
+           stay available wherever that line is. -->
+      <h2>Trade<span id="my-account">-</span><button class="linkish" id="new-key"
+          title="Make a new session-only key. The page then trades as a new account.">new key</button><button
+          class="linkish" id="remember-key" disabled
+          title="Store this demo key in this browser profile.">remember key</button></h2>
+      <div id="trade-body">
+        <div class="ticket">
+          <div class="tk tk-sym">
+            <label for="sym">Symbol</label>
+            <select id="sym"></select>
+          </div>
+          <div class="tk tk-fixed">
+            <span class="tk-l">Side</span>
+            <div class="sides">
+              <button id="side-buy" class="on-buy">Buy</button>
+              <button id="side-sell">Sell</button>
+            </div>
+          </div>
+          <!-- One control for three fields. The three are order_type,
+               time_in_force and post_only, and some of their combinations are
+               orders the exchange always refuses: post-only on a market order,
+               and post-only on an order that may not rest. Three controls
+               would let a visitor build one of those and read a refusal for
+               it. One list of named orders cannot express them at all, so the
+               refusal never happens. The names are the trader's names, and
+               `renderTerms` writes what each one does under the row. -->
+          <div class="tk tk-fixed">
+            <label for="terms">Order</label>
+            <select id="terms"></select>
+          </div>
+          <div class="tk tk-num" id="slippage-box" hidden>
+            <label for="slippage">Max slippage %</label>
+            <input id="slippage" inputmode="decimal" autocomplete="off" value="1.50"
+                   title="From 0.01% to 1.50% away from the displayed midpoint.">
+          </div>
+          <div class="tk tk-num">
+            <label for="price" id="price-label">Price</label>
+            <input id="price" inputmode="decimal" autocomplete="off" placeholder="9.72">
+          </div>
+          <div class="tk tk-num">
+            <label for="qty">Quantity</label>
+            <input id="qty" inputmode="decimal" autocomplete="off" placeholder="1.5">
+          </div>
+          <div class="tk tk-fixed route explains" id="route" hidden>
+            <span class="tk-l">Send</span>
+            <div class="sides">
+              <button id="route-feed" class="on">Direct</button>
+              <button id="route-inbox">Separate service</button>
+            </div>
+          </div>
+          <div class="tk tk-fixed">
+            <button id="send">Buy</button>
+          </div>
+          <!-- `explains` on the route line and not on the box around it:
+               `renderTerms` writes live warnings into #terms-note, and those
+               are read by every operator whether or not the sentences are on. -->
+          <div class="tk-say"><div id="terms-note"></div><div id="route-note" class="explains"></div></div>
+        </div>
+        <div class="tk-cols">
+          <div class="tk-col">
+            <h3>Open orders</h3>
+            <div class="col-head" id="my-orders-head">
+              <span>Order</span><span>Symbol</span><span>Side</span><span class="num">Price</span><span class="num">Quantity</span><span class="num" title="The distance from the price of the last trade in this symbol.">From last</span><span class="cancel"></span>
+            </div>
+            <div id="my-orders"></div>
+          </div>
+          <div class="tk-col">
+            <h3>Last order</h3>
+            <div id="trade-result"><span class="why">This browser did not send an order yet.</span></div>
+            <div id="hatch"></div>
+          </div>
+          <div class="tk-col explains">
+            <h3>This browser</h3>
+            <div class="keynote" id="key-note"></div>
+            <ol class="tk-steps">
+              <li>This page signs your order with your key.</li>
+              <li>The sequencer puts your order in the log.</li>
+              <li>The exchange matches your order against the book.</li>
+            </ol>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="gut gut-col" id="gut-right" role="separator" aria-orientation="vertical" tabindex="0"
+       aria-label="Right column width" title="Drag to change the size. Double-click for the default size."></div>
+  <div id="rightcol">
+    <div class="panel" id="trades-panel">
+      <h2>Recent Trades</h2>
+      <div class="scroll fitted" id="trades-scroll">
+        <div class="table">
+          <div class="col-head" id="trades-head">
+            <span class="num">Price</span><span class="num">Quantity</span><span class="num">Time</span>
+          </div>
+          <div class="rows" id="trades"></div>
+        </div>
+      </div>
+    </div>
+    <div class="gut gut-row" id="gut-trades" role="separator" aria-orientation="horizontal" tabindex="0"
+         aria-label="Recent trades height" title="Drag to change the size. Double-click for the default size."></div>
+    <div class="panel" id="flow-panel">
+      <h2>Order Flow</h2>
+      <div class="scroll fitted" id="flow-scroll">
+        <div class="table">
+          <div class="col-head" id="flow-head">
+            <span>Side</span><span class="num">Price</span><span class="num">Quantity</span>
+          </div>
+          <div class="rows" id="flow"></div>
+        </div>
+      </div>
+      <!-- Empty while the exchange answers. It says one thing, and only when it
+           happens: this browser cannot reach the exchange. -->
+      <div id="status"></div>
+    </div>
+  </div>
+  <div class="gut gut-row" id="gut-traders" role="separator" aria-orientation="horizontal" tabindex="0"
+       aria-label="Traders panel height" title="Drag to change the size. Double-click for the default size."></div>
+  <div id="traders">
+    <div id="traders-body">
+      <div class="tcol">
+        <div class="panel tbox">
+          <h2>Accounts <span class="note" id="bot-rule"></span> <span id="zero-sum"></span></h2>
+          <div class="scroll fitted" id="accounts-scroll">
+            <div class="table">
+              <div class="col-head" id="accounts-head">
+                <span>Account</span><span class="num">Realized</span><span class="num">Unreal.</span><span class="num">Total</span><span class="num" title="The size of the open position. The value uses the price of the last trade.">Open</span>
+              </div>
+              <div class="rows" id="accounts"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="tcol">
+        <div class="panel tbox">
+          <h2>Positions <span class="note" id="sel-label"></span></h2>
+          <div class="scroll fitted" id="positions-scroll">
+            <div class="table">
+              <div class="col-head" id="positions-head">
+                <span>Symbol</span><span class="num" title="A plus sign is a long position. A minus sign is a short position. This is the direction, not the profit.">Quantity</span><span class="num">Entry</span><span class="num">Mark</span><span class="num" title="The profit on the quantity in this row, at the price of the last trade. The account did not take this profit yet.">Unreal.</span><span class="num" title="The profit the account took when it closed quantity. This number is not about the position in this row.">Realized</span>
+              </div>
+              <div class="rows" id="positions"></div>
+            </div>
+          </div>
+          <h3>P&amp;L history <span class="note legend" id="pnl-legend"></span><span class="zoom" id="pnl-zoom">
+            <button class="iv" id="pnl-chart-out" title="Show a longer stretch of the run. Keyboard: minus.">&minus;</button>
+            <button class="iv" id="pnl-chart-in" title="Show a shorter stretch of the run. Keyboard: plus.">+</button>
+            <button class="iv" id="pnl-chart-now" title="Go back to the newest point. Keyboard: End.">now</button>
+          </span></h3>
+          <div id="pnl-wrap"><canvas id="pnl-chart" tabindex="0" role="img"
+               aria-label="Profit over time. Drag to move in time. Scroll to zoom. Arrow keys move, plus and minus zoom, End goes to the newest point, 0 resets."
+               title="Drag to move in time. Scroll to zoom. Double-click to reset."></canvas></div>
+        </div>
+      </div>
+      <div class="tcol">
+        <div class="panel tbox">
+          <h2>Trades <span class="note" id="trades-label"></span>
+            <button class="iv" id="traders-toggle">hide</button></h2>
+          <div class="scroll fitted" id="acct-trades-scroll">
+            <div class="table">
+              <div class="col-head" id="acct-trades-head">
+                <span>Time</span><span>Symbol</span><span>Side</span><span class="num">Price</span><span class="num">Quantity</span><span class="num" title="Taker: this account crossed the spread. Maker: this account rested in the book. Self: this account matched itself.">Role</span>
+              </div>
+              <div class="rows" id="acct-trades"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="gut gut-col gut-abs" id="gut-t1" role="separator" aria-orientation="vertical" tabindex="0"
+           aria-label="Accounts column width" title="Drag to change the size. Double-click for the default size."></div>
+      <div class="gut gut-col gut-abs" id="gut-t2" role="separator" aria-orientation="vertical" tabindex="0"
+           aria-label="Positions column width" title="Drag to change the size. Double-click for the default size."></div>
+    </div>
+  </div>
+</main>
+<!-- The anchors view. Hidden until the strip's anchor is clicked, and removed
+     outright when this exchange is anchored to nothing (`/anchor-config` 404s),
+     so a deployment without an anchor is a page with no dead entrances on it. -->
+<section id="anchors" hidden>
+  <div class="panel">
+    <h2>
+      <button id="ax-close" title="The Escape key and the back button of the browser do the same.">
+        <span class="arrow" aria-hidden="true">←</span>Back to the exchange</button>
+      <span id="ax-title">Anchors</span>
+    </h2>
+    <div class="body">
+      <div id="ax-alarm"></div>
+      <div id="ax-where"></div>
+    </div>
+  </div>
+  <div class="panel">
+    <h2>Your orders</h2>
+    <div class="body" id="ax-orders"></div>
+  </div>
+  <div class="panel">
+    <h2>
+      Every anchor <span class="dim" id="ax-count"></span>
+      <button class="iv" id="ax-verify-all">check every anchor</button>
+    </h2>
+    <!-- What "verify all" is about to cost, and while it runs, how far it has
+         got. Its own element because everything else in this panel is redrawn
+         from the anchor list, and a confirmation that is wiped by the next log
+         window read is a confirmation nobody gets to answer. -->
+    <div class="body" id="ax-confirm"></div>
+    <div class="body" id="ax-why"></div>
+    <div class="hscroll">
+      <div class="col-head" id="ax-head">
+        <span>#</span><span>written at (UTC)</span><span class="num">up to message</span>
+        <span>chain hash</span><span>state root</span><span class="num">block</span><span></span>
+      </div>
+      <div id="ax-rows"></div>
+    </div>
+    <div class="body" id="ax-scan"></div>
+  </div>
+  <div class="panel">
+    <h2>Check this without this page</h2>
+    <div class="body" id="ax-self"></div>
+  </div>
+</section>
+<script type="module" src="/app.js"></script>
+</body>
+</html>

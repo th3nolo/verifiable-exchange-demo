@@ -1,0 +1,36 @@
+{
+  "contract": "ExchangeRootAnchor",
+  "address": "0x4162B3218b97663dEBC1f59060910221bb95672d",
+  "chain_id": 84532,
+  "rpc": "https://sepolia.base.org",
+  "rpc_fallbacks": [
+    "https://base-sepolia-rpc.publicnode.com",
+    "https://base-sepolia.drpc.org"
+  ],
+  "tx_hash": "0x7c3264f3cc7ba24f9d7dff9de87d998b7bcf2a40e881172564d317c223c38190",
+  "block_number": 45583892,
+  "writer": "0x6192D3FD82917eAb2864F46cb63b69bC8C6E09CE",
+  "solc": "0.8.26",
+  "optimizer": {
+    "enabled": true,
+    "runs": 200
+  },
+  "selectors": {
+    "anchor(uint64,uint64,bytes8,bytes32,bytes32)": "cea5bcba",
+    "anchoredAt()": "b6ae8b1c",
+    "count()": "06661abd",
+    "lastId()": "c1292cc3",
+    "latest()": "52bfe789",
+    "rootHash()": "1d80009a",
+    "session()": "5e3568b8",
+    "stateRoot()": "9588eca2",
+    "treeSize()": "8d1ddfb1",
+    "writer()": "453a2abc"
+  },
+  "events": {
+    "AnchoredRoot(uint64,bytes8,bytes32,uint64,bytes32,uint64,uint64)": "0xf17e064140470b4f4b89eb3a9324a477206c096df6cbc3dfed400e9b4a2c191f"
+  },
+  "deployed_at": 1786936070,
+  "explorer": "https://sepolia.basescan.org",
+  "explorer_address_url": "https://sepolia.basescan.org/address/0x4162B3218b97663dEBC1f59060910221bb95672d"
+}

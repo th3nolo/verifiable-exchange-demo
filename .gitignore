@@ -1,0 +1,31 @@
+# Everything demo.sh writes: databases, logs, and the signing keys each
+# service creates on first run. Nothing in here should ever be committed.
+run/
+
+# The anchor sender's working directory: the key that writes to the contract,
+# and its record of the last anchor it sent. Ignored as a whole directory on
+# purpose. Listing the key by name would protect the file that exists today
+# and silently commit whatever the sender writes there tomorrow. The first
+# version of this rule already let a chain-cache file through that way.
+.anchor/
+
+# Belt and braces: the same files if they are ever produced somewhere else.
+# A private key reaching a public repository is not a recoverable mistake.
+*.key
+*.db
+*.db-wal
+*.db-shm
+
+# Deployment configuration and common private-key containers. The checked-in
+# example contains names only; real values stay on the deployment host.
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.token
+
+target/

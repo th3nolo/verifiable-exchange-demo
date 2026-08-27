@@ -1,0 +1,54 @@
+[package]
+name = "services"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# A deliberately dishonest exchange, for services/tests/adversarial.rs. Never
+# on by default, so `cargo build --release` compiles none of it: not the
+# `dishonest` module and not one of its call sites. See src/dishonest.rs.
+default = []
+dishonest = []
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+clap = { version = "4.5.4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+axum = "0.8.4"
+# `BroadcastStream`, and nothing else. `GET /stream` turns one broadcast channel
+# into one HTTP body per reader, and axum's `Sse` wants a `Stream`. This is the
+# tokio team's own adapter for exactly that, and it is the smallest thing that
+# does it: the alternative is a hand-written `Stream` over a `Receiver`, which
+# is the same code with our name on it and our bugs in it.
+tokio-stream = { version = "0.1", features = ["sync"] }
+rand = "0.8"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+ed25519-dalek = "2"
+sha2 = "0.11.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+# `start_paused` for the two generator tests. tokio's "full" leaves test-util
+# out on purpose, because it changes how time behaves, so it is asked for here
+# and reaches the test build only -- `cargo build --release` does not get it.
+tokio = { version = "1", features = ["test-util"] }
+# Only to drive the feed's router in tests: the cross-origin rules live in a
+# middleware layer, and a handler called directly never runs one.
+tower = { version = "0.5", features = ["util"] }
+
+# The honest tool. Everything an operator or a stranger runs is this binary.
+[[bin]]
+name = "services"
+path = "src/main.rs"
+
+# The dishonest exchange the adversarial harness drives. `required-features`
+# is what keeps it out of a release: `cargo build --release` does not build
+# this target at all, because `dishonest` is not in the default features.
+[[bin]]
+name = "dishonest-exchange"
+path = "src/bin/dishonest_exchange.rs"
+required-features = ["dishonest"]

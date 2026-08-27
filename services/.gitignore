@@ -1,0 +1,8 @@
+target/
+logs/
+# Matcher and feed databases, including SQLite's WAL and shared-memory sidecars.
+state.db*
+feed.db*
+*.key
+inbox.db*
+validator*.db*

@@ -1,0 +1,246 @@
+{
+  "solc": "0.8.26",
+  "optimizer": {
+    "enabled": true,
+    "runs": 200
+  },
+  "abi": [
+    {
+      "inputs": [],
+      "stateMutability": "nonpayable",
+      "type": "constructor"
+    },
+    {
+      "inputs": [],
+      "name": "NoSession",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "NotNewer",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "NotWriter",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "SessionChanged",
+      "type": "error"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "uint64",
+          "name": "lastId",
+          "type": "uint64"
+        },
+        {
+          "indexed": true,
+          "internalType": "bytes8",
+          "name": "session",
+          "type": "bytes8"
+        },
+        {
+          "indexed": false,
+          "internalType": "bytes32",
+          "name": "chainHash",
+          "type": "bytes32"
+        },
+        {
+          "indexed": false,
+          "internalType": "bytes32",
+          "name": "stateRoot",
+          "type": "bytes32"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint64",
+          "name": "anchoredAt",
+          "type": "uint64"
+        },
+        {
+          "indexed": false,
+          "internalType": "uint64",
+          "name": "count",
+          "type": "uint64"
+        }
+      ],
+      "name": "Anchored",
+      "type": "event"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint64",
+          "name": "_lastId",
+          "type": "uint64"
+        },
+        {
+          "internalType": "bytes8",
+          "name": "_session",
+          "type": "bytes8"
+        },
+        {
+          "internalType": "bytes32",
+          "name": "_chainHash",
+          "type": "bytes32"
+        },
+        {
+          "internalType": "bytes32",
+          "name": "_stateRoot",
+          "type": "bytes32"
+        }
+      ],
+      "name": "anchor",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "anchoredAt",
+      "outputs": [
+        {
+          "internalType": "uint64",
+          "name": "",
+          "type": "uint64"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "chainHash",
+      "outputs": [
+        {
+          "internalType": "bytes32",
+          "name": "",
+          "type": "bytes32"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "count",
+      "outputs": [
+        {
+          "internalType": "uint64",
+          "name": "",
+          "type": "uint64"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "lastId",
+      "outputs": [
+        {
+          "internalType": "uint64",
+          "name": "",
+          "type": "uint64"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "latest",
+      "outputs": [
+        {
+          "internalType": "uint64",
+          "name": "_lastId",
+          "type": "uint64"
+        },
+        {
+          "internalType": "bytes8",
+          "name": "_session",
+          "type": "bytes8"
+        },
+        {
+          "internalType": "bytes32",
+          "name": "_chainHash",
+          "type": "bytes32"
+        },
+        {
+          "internalType": "bytes32",
+          "name": "_stateRoot",
+          "type": "bytes32"
+        },
+        {
+          "internalType": "uint64",
+          "name": "_anchoredAt",
+          "type": "uint64"
+        },
+        {
+          "internalType": "uint64",
+          "name": "_count",
+          "type": "uint64"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "session",
+      "outputs": [
+        {
+          "internalType": "bytes8",
+          "name": "",
+          "type": "bytes8"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "stateRoot",
+      "outputs": [
+        {
+          "internalType": "bytes32",
+          "name": "",
+          "type": "bytes32"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    },
+    {
+      "inputs": [],
+      "name": "writer",
+      "outputs": [
+        {
+          "internalType": "address",
+          "name": "",
+          "type": "address"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    }
+  ],
+  "bytecode": "0x60a0604052348015600e575f80fd5b50336080526080516104d16100315f395f818160d1015261022601526104d15ff3fe608060405234801561000f575f80fd5b5060043610610090575f3560e01c80639588eca2116100635780639588eca2146101b9578063b6ae8b1c146101d0578063c1292cc3146101ea578063c5dfe211146101fd578063d2b5751d14610212575f80fd5b806306661abd14610094578063453a2abc146100cc57806352bfe7891461010b5780635e3568b81461018d575b5f80fd5b5f546100ae90600160801b900467ffffffffffffffff1681565b60405167ffffffffffffffff90911681526020015b60405180910390f35b6100f37f000000000000000000000000000000000000000000000000000000000000000081565b6040516001600160a01b0390911681526020016100c3565b6101445f5460015460025467ffffffffffffffff80841694600160c01b850460c01b94600160401b8104831692600160801b9091041690565b6040805167ffffffffffffffff97881681526001600160c01b031990961660208701528501939093526060840191909152831660808301529190911660a082015260c0016100c3565b5f546101a090600160c01b900460c01b81565b6040516001600160c01b031990911681526020016100c3565b6101c260025481565b6040519081526020016100c3565b5f546100ae90600160401b900467ffffffffffffffff1681565b5f546100ae9067ffffffffffffffff1681565b61021061020b36600461040e565b61021b565b005b6101c260015481565b336001600160a01b037f0000000000000000000000000000000000000000000000000000000000000000161461026457604051630751a1cd60e41b815260040160405180910390fd5b6001600160c01b0319831661028c576040516315577dcd60e31b815260040160405180910390fd5b5f54600160c01b900460c01b6001600160c01b0319166102c5575f80546001600160c01b0316600160c01b60c086901c021790556102fd565b5f546001600160c01b0319848116600160c01b90920460c01b16146102fd5760405163913ef47160e01b815260040160405180910390fd5b5f5467ffffffffffffffff9081169085161161032c57604051631feabb6960e21b815260040160405180910390fd5b5f80546001848155600284905567ffffffffffffffff8781166fffffffffffffffffffffffffffffffff1990931692909217600160401b4284160217808455909291601091610384918591600160801b900416610469565b82546101009290920a67ffffffffffffffff8181021990931691831602179091555f54604080518681526020810186905242841681830152600160801b90920483166060830152516001600160c01b031987169350918716917f846b388d9a84109263340756e41099d4945f475c34c4f401faf0850b7c6d8385916080908290030190a350505050565b5f805f8060808587031215610421575f80fd5b843567ffffffffffffffff81168114610438575f80fd5b935060208501356001600160c01b031981168114610454575f80fd5b93969395505050506040820135916060013590565b67ffffffffffffffff818116838216019081111561049557634e487b7160e01b5f52601160045260245ffd5b9291505056fea2646970667358221220e8cb087747e21129339e665e4bbd790910e3893156ddac75181dd85ca58f293c64736f6c634300081a0033",
+  "selectors": {
+    "anchor(uint64,bytes8,bytes32,bytes32)": "c5dfe211",
+    "anchoredAt()": "b6ae8b1c",
+    "chainHash()": "d2b5751d",
+    "count()": "06661abd",
+    "lastId()": "c1292cc3",
+    "latest()": "52bfe789",
+    "session()": "5e3568b8",
+    "stateRoot()": "9588eca2",
+    "writer()": "453a2abc"
+  }
+}

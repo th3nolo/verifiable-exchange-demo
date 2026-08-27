@@ -1,0 +1,78 @@
+# The two measurements CI stopped running, and nothing else.
+#
+# `services/src/feed/generate.rs` holds two tests that reintroduce generator
+# designs this repository replaced, and measure that the replaced designs build
+# bad markets. They are the evidence behind docs/GENERATOR-RFC.md. Timed one at
+# a time against the test binary, they are 700 and 300 seconds of a suite that
+# was 1,351, so they are `#[ignore]`d and this runs them.
+#
+# By name, and not with a bare `--ignored`. That was the first version of this
+# file and it was wrong in four ways, which is worth writing down because
+# `--ignored` looks like it means "the slow ones":
+#
+#   - `services/tests/market_health.rs` has two tests whose ignore reasons are
+#     "fails on master" and "measures a branch that is not merged". A blanket
+#     run is red on its first firing, for reasons that are not regressions.
+#   - Two more there are sweeps: 128 and 144 runs of 50,000 messages each,
+#     decision tools for a question nobody asks monthly.
+#   - `services/tests/adversarial.rs` puts its Tier 2 behind
+#     `#[cfg(feature = "dishonest")]`, so a run without that feature reports
+#     green on tests it never compiled.
+#   - There are 26 `#[ignore]`s in this tree, not the handful this file was
+#     written for.
+#
+# So this names the two. Adding another is one line, and the line says which
+# test and why, which a bare `--ignored` never did.
+#
+# What is NOT here, on purpose: the sensitivity of the health check itself.
+# `the_health_check_still_fails_a_generator_that_forgets` asks whether
+# `what_is_unhealthy` can still see that defect at all, it runs in 4 seconds,
+# and it runs on every commit. Moving these two out of CI must not take that
+# question with them.
+#
+# On demand. They measure decisions that were made once.
+
+name: experiments
+
+on:
+  workflow_dispatch:
+
+# Two dispatches would otherwise be two 40-minute jobs measuring the same
+# thing on contended runners.
+concurrency:
+  group: experiments
+  cancel-in-progress: false
+
+jobs:
+  measurements:
+    name: the two counterfactuals
+    runs-on: ubuntu-24.04
+    # It checks out, compiles, and runs two tests. It writes nothing.
+    permissions:
+      contents: read
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install Rust
+        working-directory: services
+        run: rustup show
+
+      # No Cargo cache. This is a rare manual measurement, so keeping the step
+      # would usually pay for an upload without producing a later cache hit.
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+
+      # Release: 700 and 300 seconds is what they cost unoptimised, and the
+      # compile is paid once here rather than on every commit.
+      #
+      # `--nocapture` because both print the tables the RFC quotes, and
+      # `--test-threads=1` so two tests printing tables do not interleave them.
+      - name: Run them
+        working-directory: services
+        run: >
+          cargo test --release --locked --lib --
+          --ignored --exact --nocapture --test-threads=1
+          feed::generate::tests::forgetting_every_order_but_the_newest_fifty_makes_the_books_grow
+          feed::generate::tests::an_order_that_never_expires_makes_the_books_grow

@@ -23,6 +23,11 @@ BIND=${BIND:-0.0.0.0}
 RATE=${RATE:-2}
 NUM_ACCOUNTS=${NUM_ACCOUNTS:-20}
 START_BOT=${START_BOT:-yes}
+LEDGER_MODE=${LEDGER_MODE:-synthetic-legacy}
+ledger_args=(--ledger-mode "$LEDGER_MODE")
+if [ "$LEDGER_MODE" = funded-simulation ]; then
+  ledger_args+=(--funding "${FUNDING_CONFIG:?funded simulation needs a mounted genesis JSON file}")
+fi
 
 # What the browser is told to talk to. These are public addresses and are not
 # the addresses these services use to reach each other, which stay loopback.
@@ -195,7 +200,7 @@ for i in 1 2 3; do
     "${pids[${#pids[@]} - 4 + i]}"
 done
 
-start --start-matcher --bind "$BIND" --matcher-port 3001 --state-db state.db \
+start --start-matcher "${ledger_args[@]}" --bind "$BIND" --matcher-port 3001 --state-db state.db \
   --feed-url http://127.0.0.1:3000 \
   --public-feed-url "$PUBLIC_FEED_URL" \
   --public-inbox-url "$PUBLIC_INBOX_URL" \

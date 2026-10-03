@@ -19,6 +19,15 @@ cd "$(dirname "$0")"
 # for comparing one local run with another.
 RATE=${RATE:-69}
 NUM_ACCOUNTS=${NUM_ACCOUNTS:-40}
+# Default is explicitly the original PnL simulation. A funded run names its
+# reproducible genesis JSON; the matcher enforces its persistence support.
+LEDGER_MODE=${LEDGER_MODE:-synthetic-legacy}
+ledger_args=(--ledger-mode "$LEDGER_MODE")
+if [ "$LEDGER_MODE" = funded-simulation ]; then
+  FUNDING_CONFIG=${FUNDING_CONFIG:-"$PWD/services/funding.example.json"}
+  if [[ "$FUNDING_CONFIG" != /* ]]; then FUNDING_CONFIG="$PWD/$FUNDING_CONFIG"; fi
+  ledger_args+=(--funding "$FUNDING_CONFIG")
+fi
 if [ "${1:-}" = "--rate" ]; then RATE="${2:?--rate needs a number}"; fi
 
 BIN=services/target/release/services
@@ -97,7 +106,7 @@ for i in 1 2 3; do wait_for "http://127.0.0.1:$((3009 + i))/attest" "validator$i
 # reaches the inbox directly, so it needs the address a browser can use, which
 # is not necessarily the one the feed drains through. The inbox's own
 # --ui-origin already defaults to this UI's two spellings of :3001.
-start matcher --start-matcher --matcher-port 3001 \
+start matcher --start-matcher "${ledger_args[@]}" --matcher-port 3001 \
   --feed-url http://127.0.0.1:3000 --state-db state.db \
   --public-inbox-url http://127.0.0.1:3002 \
   --validators http://127.0.0.1:3010,http://127.0.0.1:3011,http://127.0.0.1:3012

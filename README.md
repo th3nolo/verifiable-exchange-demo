@@ -1,5 +1,9 @@
 # Verifiable Exchange
 
+The matching engine supports an explicitly funded **spot simulation** and an
+explicit legacy PnL mode. Funding comes from reproducible configuration; there
+is no real custody or settlement. See [simulation modes and balances](docs/SPOT-SIMULATION.md).
+
 A limit-order matching engine with a signed, append-only order log. The
 sequencer (`services/src/feed.rs`) puts every message in one order and signs the
 list. The exchange (`services/src/matcher.rs`) replays those messages and

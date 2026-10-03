@@ -1,0 +1,19 @@
+# Area B validation and handoff
+
+Base: d0be3a35f1a7fed401dc01b7e416b0aac9657d28. Rust 1.91.1-x86_64-pc-windows-msvc, offline/locked. Local commits only; no push, PR, deployment, production DB migration or on-chain calls.
+
+Validated on the exact archive of f9d67ac2e3828c4ca5cb50faa4b9fe5b1ad507dc, with an absolute manifest and a new exclusive `.audit-verified-head2` target:
+
+- `cargo test --manifest-path <exact-commit>/services/Cargo.toml --locked --offline --lib recovery_ -- --nocapture`: **5 passed**, 583 filtered. Includes same future Market after Store restart, v4/v5 replay, canonical reference/extensions root, invalid claim bindings and a failed fill after a successful durable batch. The failed fill leaves the committed maker, cursor, root, trades and stream unchanged; execution pauses without volatile fallback.
+- `cargo test --manifest-path <exact-commit>/services/Cargo.toml --locked --offline --test recovery_store`: **3 passed**. Stale owner rejected for commit/heartbeat/close/metadata; cursor cannot regress; mutated latest claim fails against a separately held key; legacy recovery refusal preserves old root.
+- Existing matcher suite on f9d67ac: **107 passed, 2 failed, 4 ignored**. Both failures came from comparing different consumed chains in tests whose assertions previously compensated only for cursor. The subsequent local change compares equal cursor/chain and preserves the full MidWindow in the asserted root; this is a change in the test's execution-state comparison, not a changed historical root literal.
+- `cargo check --locked --offline --lib` passed in the active worktree. `git diff --check` passed.
+- Existing `crash_restart`: **4 passed, 2 failed at process launch** with Windows OS error 225 (antivirus/PUP block of services.exe). `order_types`, requested in the same Cargo command, did not execute after that failure. These are not counted as successful complete suites.
+
+The first archive-to-archive attempt reused an earlier target executable (four recovery tests rather than five). That attempt is not validation of the second commit. The absolute manifest plus fresh target run above compiled the second archive and ran all five.
+
+Not completed here: full library/integration suite, generated proof-fixture adaptation to the new v5 feed key context, funded SQLite restart/replay, typed ResourceLimits recovery, Unix LD_PRELOAD faults, Go/Solidity/browser/remote/real power-loss checks, benchmarks and memory/throughput measurements. Two pre-existing Windows-only SQLite imports/helpers warn; the old unused pending-change constant also warns after fail-closed polling replaced its fallback.
+
+Integration contracts are in RECOVERY-CONTRACT.md. D's complete current `ledger_canonical_bytes()` must populate `ledger-v1` at every root/snapshot boundary; `restore_ledger` runs after book/cursor reconstruction and before authenticated root comparison. C's `resource_limits_snapshot()` must populate `resource-limits-v1`; `restore_resource_limits()` precedes state loading and `validate_resource_capacity()` precedes root comparison/admission. Funded replay must use D's same genesis config and C's same limits. These connections remain the integrator's work; root v5 must not be presented as closing those obligations before they are connected.
+
+Working-tree residue: 20 accidentally inserted lines remain in the historical matcher test helper; they are excluded from every local commit. Automatic approval review rejected removing them. Use the commits, not a raw copy of the active worktree. Exact-commit test archives preserve that helper unchanged. The new regression files are formatted; formatter changes in the large existing files remain blocked by automatic review's concern about conflict churn. Read-only rustfmt check reports those authored blocks; no global format was applied.

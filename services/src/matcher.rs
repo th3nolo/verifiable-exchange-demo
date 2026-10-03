@@ -3769,7 +3769,7 @@ impl Poller {
                 if let Some(key) = &matcher_pubkey
                     && let Err(e) = store.set_matcher_pubkey(key)
                 {
-                    warn!("could not record the claim signing key: {}", e);
+                    self.pause(e); return;
                 }
                 info!("new run {} after feed restart", store.run_id());
                 MatcherState::recording(store)
@@ -9685,7 +9685,7 @@ mod tests {
             "cff3dc12f2580f6274bcb1850af505928d22138dd08a57b6e2e7245299ec05af";
         let state = awkward_positions();
         assert_eq!(
-            logchain::to_hex(&state.state_root()),
+            logchain::to_hex(&state.state_root_for_version(4)),
             AWKWARD_POSITIONS_ROOT,
             "the positions are hashed in a different order than they were"
         );
@@ -9890,7 +9890,7 @@ mod tests {
             "the registry changed how the six steps execute the same 500 messages"
         );
         assert_eq!(
-            logchain::to_hex(&engine.state_root()),
+            logchain::to_hex(&engine.state_root_for_version(4)),
             LIVE_STATE_ROOT_500,
             "the six steps reached a different state over the same 500 messages"
         );

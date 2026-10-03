@@ -125,6 +125,7 @@ struct RunSummary {
 /// do not care which audit read it.
 #[derive(Debug)]
 struct RunFacts {
+    root_version: u32,
     run_id: i64,
     /// The sequencer session this run counted its messages against, if the run
     /// recorded one. A session is a name for one log. `None` does not mean "no
@@ -339,8 +340,13 @@ fn read_db(path: &Path, wanted_run: Option<i64>) -> Result<RunRecord, String> {
     let claims = read_claims(&tx, run_id)?;
     let trades = read_trades(&tx, run_id)?;
 
+    let schema: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0)).map_err(|e| e.to_string())?;
+    let root_version = if schema >= 13 {
+        tx.query_row("SELECT root_version FROM resume_point WHERE run_id=?1", params![run_id], |row| row.get(0)).map_err(|e| e.to_string())?
+    } else { 4 };
     Ok(RunRecord {
         facts: RunFacts {
+            root_version,
             run_id,
             session,
             feed_pubkey,
@@ -738,6 +744,8 @@ impl Messages<'_> {
 /// needs to check them.
 #[derive(Debug, serde::Deserialize)]
 struct ClaimsPage {
+    #[serde(default = "legacy_root_version")]
+    root_version: u32,
     run_id: i64,
     session: String,
     cursor: OrderId,
@@ -745,6 +753,8 @@ struct ClaimsPage {
     feed_public_key: Option<String>,
     claims: Vec<WireClaim>,
 }
+
+fn legacy_root_version() -> u32 { 4 }
 
 /// One claim as served. In hex, like everything else on the wire here.
 #[derive(Debug, serde::Deserialize)]
@@ -1063,6 +1073,7 @@ impl ChainFold {
 /// The tool that settles the question must not hold two opinions.
 struct Replay {
     engine: MatcherState,
+    root_version: u32,
     /// How far this audit's view reaches, when the audit had to fix a limit.
     ///
     /// A local audit reads its claims and its trades inside one SQLite read
@@ -1162,6 +1173,7 @@ impl Replay {
         }
         Replay {
             engine: MatcherState::replaying(session),
+            root_version: 5,
             horizon,
             ahead: VecDeque::new(),
             first_from: None,
@@ -1296,7 +1308,7 @@ impl Replay {
         if !self.checked_first_before && self.first_from == Some(msg.id()) {
             self.roots.checked += 1;
             self.boundaries_checked += 1;
-            let root = self.engine.state_root();
+            let root = self.engine.state_root_for_version(self.root_version);
             let claimed = self.ahead[0].root_before;
             if root != claimed {
                 self.roots.fail(format!(
@@ -1326,14 +1338,14 @@ impl Replay {
         }
         self.messages_replayed += 1;
         if self.anchors_at.binary_search(&msg.id()).is_ok() {
-            self.at_anchors.insert(msg.id(), self.engine.state_root());
+            self.at_anchors.insert(msg.id(), self.engine.state_root_for_version(self.root_version));
         }
 
         while self.ahead.front().is_some_and(|c| c.to_msg == msg.id()) {
             let claim = self.ahead.pop_front().expect("just checked");
             self.roots.checked += 1;
             self.boundaries_checked += 1;
-            let root = self.engine.state_root();
+            let root = self.engine.state_root_for_version(self.root_version);
             if root != claim.root_after {
                 self.roots.fail(format!(
                     "after message {} the state hashes to {}, the claim says {}",
@@ -1982,7 +1994,13 @@ async fn check_run(
     let mut signatures = Check::new("every claim is signed by this run's key");
 
     let started = Instant::now();
+    if !matches!(facts.root_version, 4 | 5) { return Err(format!("unsupported execution root version {}", facts.root_version)); }
     let mut replay = Replay::new(horizon, anchors_at.clone(), &claim_session);
+    replay.root_version = facts.root_version;
+    replay.engine.set_replay_feed_key(facts.feed_pubkey.clone());
+    if anchors_at.first() == Some(&0) {
+        replay.at_anchors.insert(0, replay.engine.state_root_for_version(facts.root_version));
+    }
     let mut fold = ChainFold::new(
         head.as_ref().ok().map(|h| h.last_id),
         facts.cursor,
@@ -2549,6 +2567,7 @@ pub async fn audit_url(
     }
 
     let facts = RunFacts {
+        root_version: envelope.root_version,
         run_id: envelope.run_id,
         session: (!envelope.session.is_empty()).then(|| envelope.session.clone()),
         feed_pubkey: envelope.feed_public_key.clone(),
@@ -3815,6 +3834,7 @@ mod tests {
         };
         let record = RunRecord {
             facts: RunFacts {
+                root_version: 5,
                 run_id: 1,
                 session: Some(SESSION.to_string()),
                 feed_pubkey: Some(logchain::to_hex(key.verifying_key().as_bytes())),
@@ -3999,6 +4019,7 @@ mod tests {
             .cloned()
             .collect();
         let facts = RunFacts {
+            root_version: record.facts.root_version,
             run_id: record.facts.run_id,
             session: record.facts.session.clone(),
             feed_pubkey: record.facts.feed_pubkey.clone(),

@@ -2355,8 +2355,9 @@ mod tests {
             .expect("the plan is readable")
     }
 
-    /// A database an older build left behind opens, gains the two columns that
-    /// version 6 adds, and keeps the run and the claim it already held. The
+    /// A database an older build left behind gains the migration columns and
+    /// keeps the run and the claim it already held, even though equivalent
+    /// execution recovery is unavailable without its historical MidWindow. The
     /// old claim keeps a NULL signature, which is the truth about that claim:
     /// nobody signed it. The audit says so, and invents no signature.
     #[test]
@@ -2381,14 +2382,21 @@ mod tests {
             .expect("some v5 rows");
         }
 
-        let (store, snapshot) =
-            Store::open_with_grace(&path, "http://feed", 0, false).expect("an older file opens");
-        let snapshot = snapshot.expect("the run is resumable");
-        assert_eq!(snapshot.counters.last_seen, 3);
-        assert_eq!(store.run_id(), 1);
-        assert_eq!(store.matcher_pubkey().expect("readable"), None);
+        let error = Store::open_with_grace(&path, "http://feed", 0, false)
+            .err()
+            .expect("consumed legacy state must refuse equivalent recovery");
+        assert!(error.to_string().contains("legacy root v4 omitted MidWindow"));
 
         let conn = Connection::open(&path).expect("opens");
+        let (last_seen, matcher_pubkey): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT last_seen, matcher_pubkey FROM resume_point JOIN runs USING (run_id) WHERE run_id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("the original run and cursor remain");
+        assert_eq!(last_seen, 3);
+        assert_eq!(matcher_pubkey, None);
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("a version");
@@ -2426,9 +2434,12 @@ mod tests {
         // which is the truth about a run whose log never carried a
         // `ListSymbol` message: nobody listed anything in that run. A table
         // that did not exist would make `load` fail on every upgraded file.
+        let listing_count: i64 = conn
+            .query_row("SELECT count(*) FROM listings WHERE run_id = 1", [], |row| row.get(0))
+            .expect("the migrated registry is readable");
         assert_eq!(
-            snapshot.listings,
-            Vec::new(),
+            listing_count,
+            0,
             "an upgraded run lists nothing, because its log never listed anything"
         );
     }
@@ -2470,14 +2481,15 @@ mod tests {
         );
     }
 
-    /// A database a version 9 build wrote opens, and its run comes back with a
-    /// split of `orders_ignored` that adds up to `orders_ignored`.
+    /// A database a version 9 build wrote migrates with a split of
+    /// `orders_ignored` that adds up to `orders_ignored`. Its consumed state
+    /// cannot resume because that version did not persist MidWindow.
     ///
     /// Version 9 counted refusals and stored no reason for any of them. So the
     /// reasons are gone: the refused orders are not in this file, and nothing
     /// can bring them back. The upgrade says exactly that, under the reason
-    /// `not_recorded`. The run resumes with 5 refusals it cannot explain, and
-    /// not with 5 refusals and an empty split.
+    /// `not_recorded`. The file retains 5 refusals it cannot explain, and
+    /// not 5 refusals and an empty split.
     ///
     /// An empty split is what the exchange had before this version, and it is
     /// the wrong answer. `/market` then served 620 orders ignored, beside
@@ -2505,27 +2517,35 @@ mod tests {
             .expect("some v9 rows");
         }
 
-        let (store, snapshot) =
-            Store::open_with_grace(&path, "http://feed", 0, false).expect("an older file opens");
-        let snapshot = snapshot.expect("the run is resumable");
-        assert_eq!(store.run_id(), 1);
-        assert_eq!(snapshot.counters.orders_ignored, 5, "the total is kept");
+        let error = Store::open_with_grace(&path, "http://feed", 0, false)
+            .err()
+            .expect("consumed legacy state must refuse equivalent recovery");
+        assert!(error.to_string().contains("legacy root v4 omitted MidWindow"));
+
+        let conn = Connection::open(&path).expect("opens");
+        let orders_ignored: i64 = conn
+            .query_row("SELECT orders_ignored FROM resume_point WHERE run_id = 1", [], |row| row.get(0))
+            .expect("the original count remains");
+        let mut statement = conn
+            .prepare("SELECT kind, count FROM orders_ignored_kinds WHERE run_id = 1")
+            .expect("the migrated reasons exist");
+        let reasons: BTreeMap<String, i64> = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("the reasons are readable")
+            .collect::<rusqlite::Result<_>>()
+            .expect("the reasons are valid rows");
+        assert_eq!(orders_ignored, 5, "the total is kept");
         assert_eq!(
-            snapshot.counters.orders_ignored_by_kind,
+            reasons,
             BTreeMap::from([("not_recorded".to_string(), 5)]),
             "an older build counted these and stored no reason for any of them"
         );
         assert_eq!(
-            snapshot
-                .counters
-                .orders_ignored_by_kind
-                .values()
-                .sum::<u64>(),
-            snapshot.counters.orders_ignored,
+            reasons.values().sum::<i64>(),
+            orders_ignored,
             "the reasons add up to the total even when the reason is 'nobody wrote one'"
         );
 
-        let conn = Connection::open(&path).expect("opens");
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("a version");
@@ -2543,7 +2563,7 @@ mod tests {
             let conn = Connection::open(&path).expect("opens");
             conn.execute_batch(V9_SCHEMA).expect("the v9 schema");
             conn.execute_batch(
-                "INSERT INTO runs (started_at, heartbeat_ms, status, feed_url, owner_pid, epoch)
+                "INSERT INTO runs (started_at, heartbeat_ms, status, feed_url, owner_pid)
                    VALUES (0, 0, 'stopped', 'http://feed', 0);
                  INSERT INTO resume_point (run_id, last_seen, messages_processed,
                                            cancels_applied, cancels_ignored, orders_ignored,
@@ -2556,11 +2576,19 @@ mod tests {
             .expect("some v9 rows");
         }
 
-        let (_store, snapshot) =
-            Store::open_with_grace(&path, "http://feed", 0, false).expect("an older file opens");
-        let snapshot = snapshot.expect("the run is resumable");
-        assert_eq!(snapshot.counters.orders_ignored, 0);
-        assert!(snapshot.counters.orders_ignored_by_kind.is_empty());
+        let error = Store::open_with_grace(&path, "http://feed", 0, false)
+            .err()
+            .expect("consumed legacy state must refuse equivalent recovery");
+        assert!(error.to_string().contains("legacy root v4 omitted MidWindow"));
+        let conn = Connection::open(&path).expect("opens");
+        let orders_ignored: i64 = conn
+            .query_row("SELECT orders_ignored FROM resume_point WHERE run_id = 1", [], |row| row.get(0))
+            .expect("the original count remains");
+        let reason_count: i64 = conn
+            .query_row("SELECT count(*) FROM orders_ignored_kinds WHERE run_id = 1", [], |row| row.get(0))
+            .expect("the migrated reasons exist");
+        assert_eq!(orders_ignored, 0);
+        assert_eq!(reason_count, 0);
     }
 
     /// A later migration can still drop every column of every table this

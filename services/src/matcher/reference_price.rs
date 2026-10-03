@@ -64,16 +64,7 @@
 //! window has already moved past, because the kept sums cover samples that
 //! reach beyond that moment.
 //!
-//! # What this deliberately does not do
-//!
-//! The window is not written to disk and it is not in the state root. An
-//! engine resumed from the state database starts with an empty window. It has
-//! no reference price, so it refuses market orders until it has watched a book
-//! for long enough. That is a refusal, and never a wrong fill. It is still a
-//! real difference between a resumed engine and `--audit`, which replays the
-//! same history from message 1 and does have the window. Putting the window in
-//! the state root instead would change the root's encoding, and every run has
-//! already committed to that encoding.
+//! Root v5 persists and authenticates this window, including its clipping time.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -88,7 +79,7 @@ use std::collections::{HashMap, VecDeque};
 pub(super) const WINDOW_MS: u64 = 30_000;
 
 /// The mid prices one engine has watched, per symbol.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(super) struct MidWindow {
     per_symbol: HashMap<String, SymbolWindow>,
 }
@@ -105,7 +96,7 @@ pub(super) struct MidWindow {
 ///
 /// The timestamps always go up. `observe` replaces a sample rather than adding
 /// a second one at the same millisecond.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct SymbolWindow {
     /// The samples, oldest first.
     samples: VecDeque<(u64, Option<i64>)>,
@@ -268,6 +259,32 @@ impl SymbolWindow {
 }
 
 impl MidWindow {
+    pub(super) fn snapshot(&self) -> std::collections::BTreeMap<String, crate::store::MidWindowRow> {
+        self.per_symbol.iter().map(|(symbol, window)| (symbol.clone(), crate::store::MidWindowRow {
+            clip_ms: window.clip_ms, samples: window.samples.iter().copied().collect(),
+        })).collect()
+    }
+    pub(super) fn restore(rows: std::collections::BTreeMap<String, crate::store::MidWindowRow>) -> Result<Self, crate::store::StoreError> {
+        let mut result = Self::default();
+        for (symbol, row) in rows {
+            if row.samples.is_empty() || row.samples.len() > WINDOW_MS as usize + 1
+                || row.samples.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+                || row.samples.iter().any(|(_, mid)| mid.is_some_and(|mid| mid <= 0)) {
+                return Err(crate::store::StoreError::Corrupt("invalid MidWindow samples".into()));
+            }
+            let mut window = SymbolWindow { samples: row.samples.into(), clip_ms: row.clip_ms, ..Default::default() };
+            for index in 0..window.samples.len().saturating_sub(1) {
+                let (from, mid) = window.samples[index];
+                if let Some(mid) = mid {
+                    let held = window.samples[index + 1].0.saturating_sub(from.max(window.clip_ms)) as i128;
+                    window.closed_weight += held;
+                    window.closed_weighted += mid as i128 * held;
+                }
+            }
+            result.per_symbol.insert(symbol, window);
+        }
+        Ok(result)
+    }
     /// Records what a symbol's mid became, at the millisecond on the message
     /// that moved its book.
     ///

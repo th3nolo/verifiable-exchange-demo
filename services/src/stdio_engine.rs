@@ -188,7 +188,7 @@
 //! `docs/ENGINE.md` states this exchange's rule.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::{BufRead, BufWriter, Write};
+use std::io::{BufRead, BufWriter, Read, Write};
 
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
@@ -196,7 +196,7 @@ use serde::{Deserialize, Serialize};
 use crate::domain::{
     AccountId, OPERATOR_ACCOUNT, OrderId, OrderMessage, OrderType, Side, TimeInForce,
 };
-use crate::matcher::MatcherState;
+use crate::matcher::{MatcherState, ResourceLimits};
 use crate::operator;
 
 /// The 32 bytes the operator signing key is made from. Any fixed value works.
@@ -236,6 +236,8 @@ enum Incoming {
     #[serde(rename = "init")]
     Init {
         markets: Vec<MarketSpec>,
+        #[serde(default)]
+        limits: ResourceLimits,
         #[allow(dead_code)]
         stp: String,
     },
@@ -367,10 +369,33 @@ struct Bridge {
 
 impl Bridge {
     /// Build the exchange, list the markets, and turn the self-trade rule on.
+    #[cfg(test)]
     fn start(markets: &[MarketSpec], messages_per_second: f64) -> Bridge {
+        Self::start_with_limits(markets, messages_per_second, ResourceLimits::default())
+            .expect("valid test markets and limits")
+    }
+
+    fn start_with_limits(
+        markets: &[MarketSpec],
+        messages_per_second: f64,
+        limits: ResourceLimits,
+    ) -> std::io::Result<Bridge> {
+        limits.validate().map_err(invalid_input)?;
+        if markets.len() as u64 > limits.max_symbols || markets.len() > u16::MAX as usize + 1 {
+            return Err(invalid_input("market count exceeds symbol capacity"));
+        }
+        let mut names = std::collections::HashSet::new();
+        for market in markets {
+            operator::valid_symbol(&market.name).map_err(invalid_input)?;
+            if !names.insert(&market.name) {
+                return Err(invalid_input("duplicate market name"));
+            }
+        }
         let key = SigningKey::from_bytes(&KEY_BYTES);
         let mut bridge = Bridge {
-            engine: MatcherState::new(),
+            engine: MatcherState::new()
+                .with_resource_limits(limits)
+                .map_err(invalid_input)?,
             symbols: markets.iter().map(|m| m.name.clone()).collect(),
             next_message_id: 1,
             placed: HashMap::new(),
@@ -429,7 +454,7 @@ impl Bridge {
                 "market {index} ({name}) is not listed: the exchange refused the listing"
             );
         }
-        bridge
+        Ok(bridge)
     }
 
     /// The next message number, and step the counter.
@@ -555,6 +580,22 @@ impl Bridge {
             }];
         };
 
+        // An active harness id must keep its original owner and engine id.
+        // Completed ids may be reused because their mappings are removed only
+        // after their last event has been translated.
+        if self.placed.contains_key(&order_id) {
+            eprintln!("stdio engine: active order id {order_id} cannot be reused");
+            let seq = self.take_seq();
+            return vec![Emitted::OrderRejected {
+                seq,
+                symbol,
+                order_id,
+                account,
+                // Keep the harness's fixed refusal vocabulary.
+                reason: "BadQty",
+            }];
+        }
+
         let message_id = self.take_message_id();
         self.placed.insert(
             order_id,
@@ -566,7 +607,6 @@ impl Bridge {
         );
         self.harness_ids.insert(message_id, order_id);
 
-        let trades_before = self.engine.trades_total();
         // price_cents == price_ticks, and qty_tenths == qty * 10. The module
         // comment states both conversions.
         let message = OrderMessage::New {
@@ -582,9 +622,10 @@ impl Bridge {
             time_in_force: TimeInForce::GoodTillCancel,
             post_only: false,
         };
-        self.write_message_without_counters(&message);
-
-        let trades_after = self.engine.trades_total();
+        let trades = self
+            .engine
+            .apply_message_with_trades(&message)
+            .expect("this module numbers its own messages, so they are always in order");
         let rested_tenths = self
             .engine
             .open_order(message_id)
@@ -595,9 +636,9 @@ impl Bridge {
         // A refusal after a fill is not: matching step 5 stops on a position
         // that would overflow, and the fills before it are real. Those events
         // must be written, or the quantity the harness counts stops adding up.
-        let refused_outright =
-            refusal.filter(|_| trades_after == trades_before && rested_tenths == 0);
+        let refused_outright = refusal.filter(|_| trades.is_empty() && rested_tenths == 0);
         if let Some(kind) = refused_outright {
+            self.forget_order(message_id);
             let seq = self.take_seq();
             return vec![Emitted::OrderRejected {
                 seq,
@@ -608,7 +649,7 @@ impl Bridge {
             }];
         }
 
-        let mut events = Vec::new();
+        let mut events = Vec::with_capacity(trades.len() + 2);
         let seq = self.take_seq();
         events.push(Emitted::OrderAccepted {
             seq,
@@ -624,13 +665,9 @@ impl Bridge {
         });
 
         let mut filled_tenths = 0;
-        for trade_id in (trades_before + 1)..=trades_after {
-            let trade = self
-                .engine
-                .trade(trade_id)
-                .expect("a trade this message made is still in the window");
-            let price_cents = (trade.price * 100.0).round() as i64;
-            let qty_tenths = (trade.quantity * 10.0).round() as i64;
+        for trade in &trades {
+            let price_cents = trade.price_cents;
+            let qty_tenths = trade.qty_tenths;
             let maker_account = trade.maker_account;
             let maker = *self
                 .harness_ids
@@ -664,12 +701,43 @@ impl Bridge {
                 reason: if market { "MarketRemainder" } else { "User" },
             });
         }
+        if rested_tenths == 0 {
+            self.forget_order(message_id);
+        }
+        for trade in trades {
+            if self.engine.open_order(trade.maker_order).is_none() {
+                self.forget_order(trade.maker_order);
+            }
+        }
         events
+    }
+
+    /// Drop both directions together, after all events needing this identity.
+    fn forget_order(&mut self, message_id: OrderId) {
+        if let Some(harness_id) = self.harness_ids.remove(&message_id) {
+            if self
+                .placed
+                .get(&harness_id)
+                .is_some_and(|p| p.message_id == message_id)
+            {
+                self.placed.remove(&harness_id);
+            }
+        }
     }
 
     /// Take a resting order off the book.
     fn cancel(&mut self, cmd_seq: u64, symbol: u16, order_id: u64) -> Vec<Emitted> {
         let placed = self.placed.get(&order_id).copied();
+        if placed.is_some_and(|p| p.symbol != symbol) {
+            let seq = self.take_seq();
+            return vec![Emitted::OrderRejected {
+                seq,
+                symbol,
+                order_id,
+                account: placed.expect("placed order").account,
+                reason: "UnknownOrder",
+            }];
+        }
         let resting = placed.and_then(|p| {
             self.engine
                 .open_order(p.message_id)
@@ -705,6 +773,7 @@ impl Bridge {
             return Vec::new();
         }
         let seq = self.take_seq();
+        self.forget_order(placed.message_id);
         vec![Emitted::OrderCancelled {
             seq,
             symbol: placed.symbol,
@@ -766,16 +835,60 @@ fn reject_reason(kind: &str) -> &'static str {
 /// Read the harness's commands on standard input and write its events on
 /// standard output. It returns when standard input ends.
 pub fn run(messages_per_second: f64) -> std::io::Result<()> {
-    assert!(
-        messages_per_second > 0.0,
-        "--stdio-messages-per-second must be above zero"
-    );
+    run_with_max_line_bytes(messages_per_second, 1024 * 1024)
+}
+
+fn invalid_input(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, message.into())
+}
+
+/// Configures the input-buffer bound, independent of the historical windows.
+pub fn run_with_max_line_bytes(
+    messages_per_second: f64,
+    max_line_bytes: usize,
+) -> std::io::Result<()> {
     let input = std::io::stdin();
     let mut output = BufWriter::new(std::io::stdout());
-    let mut bridge: Option<Bridge> = None;
+    run_io(
+        input.lock(),
+        &mut output,
+        messages_per_second,
+        max_line_bytes,
+    )
+}
 
-    for line in input.lock().lines() {
-        let line = line?;
+fn run_io(
+    mut input: impl BufRead,
+    output: &mut impl Write,
+    messages_per_second: f64,
+    max_line_bytes: usize,
+) -> std::io::Result<()> {
+    if !messages_per_second.is_finite() || messages_per_second <= 0.0 {
+        return Err(invalid_input(
+            "--stdio-messages-per-second must be finite and above zero",
+        ));
+    }
+    if max_line_bytes == 0 || max_line_bytes == usize::MAX {
+        return Err(invalid_input(
+            "max line bytes must be positive and below usize::MAX",
+        ));
+    }
+    let mut bridge: Option<Bridge> = None;
+    let mut buffer = Vec::new();
+    loop {
+        buffer.clear();
+        let read = (&mut input)
+            .take(max_line_bytes as u64 + 1)
+            .read_until(b'\n', &mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        if buffer.len() > max_line_bytes {
+            return Err(invalid_input(format!(
+                "stdio line exceeds {max_line_bytes} bytes"
+            )));
+        }
+        let line = std::str::from_utf8(&buffer).map_err(|e| invalid_input(e.to_string()))?;
         if line.trim().is_empty() {
             continue;
         }
@@ -787,8 +900,10 @@ pub fn run(messages_per_second: f64) -> std::io::Result<()> {
             }
         };
         match incoming {
-            Incoming::Init { markets, .. } => {
-                let started = Bridge::start(&markets, messages_per_second);
+            Incoming::Init {
+                markets, limits, ..
+            } => {
+                let started = Bridge::start_with_limits(&markets, messages_per_second, limits)?;
                 eprintln!(
                     "stdio engine: listed {} market(s) under rule set {}",
                     started.symbols.len(),
@@ -800,7 +915,7 @@ pub fn run(messages_per_second: f64) -> std::io::Result<()> {
             Incoming::Command { cmd_seq, command } => {
                 let bridge = bridge
                     .as_mut()
-                    .expect("the harness sends its init line before any command");
+                    .ok_or_else(|| invalid_input("init must precede command"))?;
                 for event in bridge.command(cmd_seq, command) {
                     writeln!(output, "{}", serde_json::to_string(&event)?)?;
                 }
@@ -819,6 +934,233 @@ pub fn run(messages_per_second: f64) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_init_and_commands_reject_capacity_and_recover_after_cancel() {
+        let limits = ResourceLimits {
+            max_active_orders: 1,
+            max_positions: 2,
+            max_symbols: 2,
+        };
+        let mut bridge = Bridge::start_with_limits(&markets(), 6.0, limits).unwrap();
+        bridge.command(1, limit(1, 3, Side::Sell, 10000, 1));
+        let rejected = bridge.command(2, limit(2, 4, Side::Buy, 10000, 1));
+        assert!(matches!(
+            rejected[0],
+            Emitted::OrderRejected {
+                reason: "BadQty",
+                ..
+            }
+        ));
+        assert_eq!(
+            bridge.engine.orders_ignored_by_kind()["active_order_capacity"],
+            1
+        );
+        assert_eq!(bridge.engine.trades_total(), 0);
+        assert_eq!(bridge.placed.len(), 1);
+        assert_eq!(bridge.harness_ids.len(), 1);
+        bridge.command(
+            3,
+            Order::Cancel {
+                symbol: 0,
+                order_id: 1,
+            },
+        );
+        bridge.command(4, limit(2, 4, Side::Sell, 10000, 1));
+        assert_eq!(bridge.placed[&2].account, 4);
+        assert!(
+            Bridge::start_with_limits(
+                &markets(),
+                6.0,
+                ResourceLimits {
+                    max_symbols: 1,
+                    ..limits
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn protocol_writes_all_10001_fills_and_the_command_terminator() {
+        let fills = crate::matcher::TRADE_WINDOW + 1;
+        let mut input = String::from(
+            "{\"type\":\"init\",\"markets\":[{\"name\":\"M1\",\"tick_size\":0.01}],\"stp\":\"reject_incoming\"}\n",
+        );
+        for id in 1..=fills + 1 {
+            let command = serde_json::json!({"type":"command", "cmd_seq":id,
+                "command":{"type":"Limit", "symbol":0, "order_id":id,
+                    "account": if id <= fills { 3 } else { 4 },
+                    "side": if id <= fills { "Sell" } else { "Buy" },
+                    "price_ticks":10000, "qty": if id <= fills { 1 } else { fills }}});
+            input.push_str(&command.to_string());
+            input.push('\n');
+        }
+        let mut output = Vec::new();
+        run_io(std::io::Cursor::new(input), &mut output, 6.0, 1024 * 1024).unwrap();
+        let lines: Vec<serde_json::Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let trades: Vec<_> = lines
+            .iter()
+            .filter(|line| line["type"] == "Trade")
+            .collect();
+        assert_eq!(trades.len(), fills);
+        assert_eq!(trades.first().unwrap()["resting"], 1);
+        assert_eq!(trades.last().unwrap()["resting"], fills);
+        assert_eq!(
+            lines.last().unwrap(),
+            &serde_json::json!({"type":"events_end", "cmd_seq":fills + 1})
+        );
+    }
+
+    #[test]
+    fn oversized_lines_fail_before_command_admission() {
+        let mut output = Vec::new();
+        let oversized = vec![b' '; 66];
+        let error = run_io(std::io::Cursor::new(oversized), &mut output, 6.0, 64).unwrap_err();
+        assert!(error.to_string().contains("exceeds 64 bytes"));
+        assert!(output.is_empty());
+        // The exact boundary remains valid, including its newline.
+        let mut exact_line = vec![b' '; 64];
+        exact_line[63] = b'\n';
+        run_io(std::io::Cursor::new(exact_line), &mut output, 6.0, 64).unwrap();
+        assert!(
+            run_io(
+                std::io::Cursor::new(Vec::<u8>::new()),
+                &mut output,
+                f64::NAN,
+                64
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn closed_cancelled_and_rejected_orders_leave_no_identity_history() {
+        let mut bridge = bridge();
+        for cycle in 0..500 {
+            let seq = cycle * 5;
+            bridge.command(seq + 1, limit(1, 3, Side::Sell, 10000, 2));
+            let partial = bridge.command(seq + 2, limit(2, 4, Side::Buy, 10000, 1));
+            assert!(matches!(partial[1], Emitted::Trade { resting: 1, .. }));
+            assert_eq!(bridge.placed.len(), 1);
+            assert_eq!(bridge.harness_ids.len(), 1);
+            let closed = bridge.command(seq + 3, limit(2, 4, Side::Buy, 10000, 1));
+            assert!(matches!(closed[1], Emitted::Trade { resting: 1, .. }));
+            assert!(bridge.placed.is_empty());
+            assert!(bridge.harness_ids.is_empty());
+            bridge.command(seq + 4, limit(3, 3, Side::Buy, 9990, 1));
+            bridge.command(
+                seq + 5,
+                Order::Cancel {
+                    symbol: 0,
+                    order_id: 3,
+                },
+            );
+            assert!(bridge.placed.is_empty());
+            assert!(bridge.harness_ids.is_empty());
+            let rejected = bridge.command(seq + 5, limit(4, 4, Side::Buy, 0, 1));
+            assert!(matches!(rejected[0], Emitted::OrderRejected { .. }));
+            assert!(bridge.placed.is_empty());
+            assert!(bridge.harness_ids.is_empty());
+        }
+    }
+
+    #[test]
+    fn reusing_an_active_id_cannot_replace_its_owner_or_cancel_target() {
+        let mut bridge = bridge();
+        bridge.command(1, limit(7, 3, Side::Sell, 10000, 2));
+        let original = bridge.placed[&7].message_id;
+        let root = bridge.engine.state_root();
+        let duplicate = bridge.command(2, limit(7, 4, Side::Buy, 10000, 1));
+        assert!(matches!(
+            duplicate[0],
+            Emitted::OrderRejected {
+                reason: "BadQty",
+                account: 4,
+                ..
+            }
+        ));
+        assert_eq!(bridge.engine.state_root(), root);
+        assert_eq!(bridge.placed[&7].message_id, original);
+        assert_eq!(bridge.placed[&7].account, 3);
+        let wrong_market = bridge.command(
+            3,
+            Order::Cancel {
+                symbol: 1,
+                order_id: 7,
+            },
+        );
+        assert!(matches!(
+            wrong_market[0],
+            Emitted::OrderRejected {
+                reason: "UnknownOrder",
+                ..
+            }
+        ));
+        assert!(bridge.engine.open_order(original).is_some());
+        let cancel = bridge.command(
+            4,
+            Order::Cancel {
+                symbol: 0,
+                order_id: 7,
+            },
+        );
+        assert!(matches!(
+            cancel[0],
+            Emitted::OrderCancelled {
+                account: 3,
+                qty: 2,
+                ..
+            }
+        ));
+        bridge.command(5, limit(7, 4, Side::Sell, 10000, 1));
+        let fill = bridge.command(6, limit(8, 5, Side::Buy, 10000, 1));
+        assert!(matches!(
+            fill[1],
+            Emitted::Trade {
+                resting: 7,
+                accounts: (5, 4),
+                ..
+            }
+        ));
+        assert!(bridge.placed.is_empty());
+        assert!(bridge.harness_ids.is_empty());
+    }
+
+    #[test]
+    fn a_command_emits_every_fill_even_beyond_the_recent_trade_window() {
+        for fills in [
+            crate::matcher::TRADE_WINDOW,
+            crate::matcher::TRADE_WINDOW + 1,
+        ] {
+            let mut bridge = bridge();
+            for id in 1..=fills as u64 {
+                bridge.command(id, limit(id, 3, Side::Sell, 10000, 1));
+            }
+            let events = bridge.command(
+                fills as u64 + 1,
+                limit(fills as u64 + 1, 4, Side::Buy, 10000, fills as u64),
+            );
+            assert_eq!(events.len(), fills + 1);
+            for (index, event) in events[1..].iter().enumerate() {
+                assert!(matches!(event, Emitted::Trade {
+                    resting, qty: 1, accounts: (4, 3), price_ticks: 10000, ..
+                } if *resting == index as u64 + 1));
+            }
+            assert_eq!(bridge.engine.trades_total(), fills as u64);
+            assert_eq!(bridge.engine.trades().count(), crate::matcher::TRADE_WINDOW);
+            assert_eq!(
+                bridge.engine.trade(1).is_some(),
+                fills == crate::matcher::TRADE_WINDOW
+            );
+            assert!(bridge.placed.is_empty());
+            assert!(bridge.harness_ids.is_empty());
+        }
+    }
 
     /// Three markets, named the way the harness names them.
     fn markets() -> Vec<MarketSpec> {

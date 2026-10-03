@@ -1192,6 +1192,10 @@ pub(super) async fn produce_orders(
         // `sequence` has already logged a failed write, and a failed write
         // publishes nothing. The next tick hands out the same ids again.
         let _ = with_state(&state, move |state| {
+            if let Err(detail) = state.check_retention_growth(count as u64, 0, 0) {
+                tracing::error!("generator admission refused: {}", detail);
+                return;
+            }
             let burst: Vec<OrderMessage> = (0..count)
                 .map(|_| {
                     let msg = generate_message(state);

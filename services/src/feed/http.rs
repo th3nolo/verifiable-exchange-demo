@@ -1219,6 +1219,9 @@ async fn submit(
                 ),
             ));
         }
+        state
+            .check_retention_growth(1, 1, 0)
+            .map_err(|detail| (StatusCode::SERVICE_UNAVAILABLE, detail))?;
         let id = state.next_id;
         state.next_id += 1;
         let timestamp = state.clock.now_ms();
@@ -1484,6 +1487,9 @@ pub(super) async fn submit_operator(
                 ),
             ));
         }
+        state
+            .check_retention_growth(1, 1, 0)
+            .map_err(|detail| (StatusCode::SERVICE_UNAVAILABLE, detail))?;
         let id = state.next_id;
         state.next_id += 1;
         let msg = req.message(id, state.clock.now_ms());

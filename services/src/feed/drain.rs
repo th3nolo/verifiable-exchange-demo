@@ -53,6 +53,7 @@ pub(super) struct Drain {
     epoch: Option<String>,
     /// The marks that were refused, by entry id inside `epoch`.
     trouble: HashMap<i64, Trouble>,
+    max_trouble: u64,
     /// When this sequencer last wrote a line saying it cannot read the
     /// separate service.
     last_complaint: Option<Instant>,
@@ -87,6 +88,7 @@ impl Drain {
             client,
             epoch: None,
             trouble: HashMap::new(),
+            max_trouble: super::RetentionLimits::default().max_retry_records,
             last_complaint: None,
         })
     }
@@ -95,7 +97,7 @@ impl Drain {
     fn due(&self, inbox_id: i64, now: Instant) -> bool {
         match self.trouble.get(&inbox_id) {
             Some(trouble) => !trouble.given_up && trouble.next_try <= now,
-            None => true,
+            None => (self.trouble.len() as u64) < self.max_trouble,
         }
     }
 
@@ -106,6 +108,16 @@ impl Drain {
     /// Records a failed mark. Returns true when this attempt is the one that
     /// gives up, so the caller writes that line exactly once.
     fn failed(&mut self, inbox_id: i64, refused: bool, now: Instant) -> bool {
+        // A pending page can contain more failures than there is headroom.
+        // Refuse further retry tracking without evicting prior backoff/give-up
+        // decisions. The entry remains pending on the independent inbox.
+        if !self.trouble.contains_key(&inbox_id) && self.trouble.len() as u64 >= self.max_trouble {
+            warn!(
+                "inbox retry capacity {} exhausted; entry {} remains pending",
+                self.max_trouble, inbox_id
+            );
+            return true;
+        }
         let trouble = self.trouble.entry(inbox_id).or_insert(Trouble {
             attempts: 0,
             refusals: 0,
@@ -146,6 +158,11 @@ impl Drain {
 /// plain flag that can point at any address. The checks that address says it
 /// ran are not evidence to a service that has to stand behind the result.
 pub(super) async fn drain_inbox(drain: &mut Drain, inbox_url: &str, state: &Arc<Mutex<FeedState>>) {
+    let Ok(max_trouble) = with_state(state, |state| state.retention_limits.max_retry_records).await
+    else {
+        return;
+    };
+    drain.max_trouble = max_trouble;
     let Some((epoch, pending)) = drain.pending(inbox_url).await else {
         return;
     };
@@ -165,6 +182,9 @@ pub(super) async fn drain_inbox(drain: &mut Drain, inbox_url: &str, state: &Arc<
     }
 
     let now = Instant::now();
+    if drain.trouble.len() as u64 >= drain.max_trouble {
+        drain.complain(format_args!("inbox retry capacity exhausted; new entries remain pending until retry capacity is available"));
+    }
     let due: Vec<InboxEntry> = pending
         .into_iter()
         .filter(|entry| drain.due(entry.inbox_id, now))
@@ -457,6 +477,11 @@ pub(super) fn sequence_drained(
             pairs.push((entry.inbox_id, feed_id, in_this_batch));
             continue;
         }
+        let proposed = batch.len() as u64 + 1;
+        if let Err(detail) = state.check_retention_growth(proposed, proposed, proposed) {
+            refused_at_intake.push((entry.inbox_id, detail));
+            continue;
+        }
         let id = state.next_id;
         state.next_id += 1;
         let timestamp = state.clock.now_ms();
@@ -734,6 +759,21 @@ mod tests {
         assert!(drain.due(2, now));
         drain.succeeded(1);
         assert!(drain.due(1, now), "a success clears the record");
+    }
+
+    #[test]
+    fn retry_capacity_retains_prior_decisions_and_keeps_new_entries_pending() {
+        let mut drain = Drain::new().unwrap();
+        drain.max_trouble = 1;
+        let now = Instant::now();
+        drain.failed(1, true, now);
+        assert!(!drain.due(2, now));
+        assert!(drain.failed(2, true, now));
+        assert_eq!(drain.trouble.len(), 1);
+        assert!(drain.trouble.contains_key(&1));
+        assert!(!drain.due(1, now));
+        drain.succeeded(1);
+        assert!(drain.due(2, now));
     }
 
     #[test]

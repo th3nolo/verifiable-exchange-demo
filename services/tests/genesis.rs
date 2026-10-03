@@ -361,6 +361,8 @@ async fn a_new_log_opens_with_the_rules_and_the_symbols() {
         matcher_port,
         &[
             "--start-matcher",
+            "--ledger-mode",
+            "synthetic-legacy",
             "--matcher-port",
             &matcher_port.to_string(),
             "--feed-url",

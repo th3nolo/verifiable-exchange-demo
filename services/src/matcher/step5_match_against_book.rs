@@ -60,6 +60,11 @@ pub(super) struct BookAndTrades<'a> {
     /// The book of the symbol being matched. Its levels are keyed by price in
     /// cents; each level is a queue, oldest first.
     pub(super) book: &'a mut Book,
+    pub(super) ledger: &'a mut crate::ledger::Ledger,
+    /// A/integrator sets true only after committing the fully staged ledger
+    /// from the SAME immutable FOK plan, before execute_fok. Then commit_fill
+    /// must not recalculate or settle these asset effects a second time.
+    pub(super) ledger_plan_committed: bool,
     /// Where an open order lives, so a cancel can find it without scanning the
     /// book. A resting order that fills completely comes out of this map.
     pub(super) open_orders: &'a mut HashMap<OrderId, OrderRef>,
@@ -188,6 +193,14 @@ pub(super) fn execute(order: &IncomingOrder, into: &mut BookAndTrades<'_>) -> Ma
                 overflowed = true;
                 break;
             };
+
+            // Positions have been checked, and the complete funded command
+            // was preflighted before reservation. Settle both asset sides
+            // atomically before touching book, positions or trade records.
+            if !into.ledger_plan_committed {
+                into.ledger.settle_fill(maker_id, id, level_price, fill)
+                    .expect("complete funded command plan accepted every fill");
+            }
 
             maker.qty_tenths -= fill;
             remaining -= fill;

@@ -14,6 +14,7 @@ pub mod feed;
 pub mod fetch;
 mod http_security;
 pub mod inbox;
+pub mod ledger;
 pub mod logchain;
 pub mod matcher;
 pub mod merkle;

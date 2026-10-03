@@ -27,6 +27,7 @@ use tracing_subscriber::FmtSubscriber;
 
 use crate::domain::{AccountId, OrderId, OrderMessage, Side, to_grid};
 use crate::inbox::warn_if_public;
+use crate::ledger::{FundingConfig, Ledger, LedgerError, LedgerMode, LedgerSnapshot};
 use crate::logchain::{self, AttestStatus, Chain, EMPTY_CHAIN, StateRoot};
 use crate::operator::{self, valid_symbol};
 use crate::store::{
@@ -103,6 +104,7 @@ use sha2::{Digest, Sha256};
 // separate copy, and `verify.rs` must not import any of this, ENGINE.md
 // section 5. Two implementations that share matching code cannot catch each
 // other's bugs.
+mod funded;
 mod pipeline;
 mod reference_price;
 mod step1_resolve_symbol;
@@ -643,6 +645,8 @@ pub struct MatcherState {
     /// The holding of each account in each symbol, built from executed fills
     /// and from nothing else.
     positions: HashMap<(AccountId, String), Position>,
+    /// Spendable simulated assets, separate from per-symbol PnL.
+    ledger: Ledger,
     /// The newest messages from the sequencer, unchanged, so the user interface
     /// can show the order flow without its own connection to the sequencer. The
     /// window has a limit, because the sequencer can run longer than the
@@ -804,6 +808,7 @@ pub struct MatcherState {
 }
 
 impl MatcherState {
+    /// Compatibility constructor: synthetic PnL, without funded balances.
     pub fn new() -> Self {
         MatcherState {
             symbols: SymbolRegistry::default(),
@@ -814,6 +819,7 @@ impl MatcherState {
             trades_total: 0,
             aggregates: HashMap::new(),
             positions: HashMap::new(),
+            ledger: Ledger::synthetic_legacy(),
             recent_messages: VecDeque::new(),
             last_seen: 0,
             messages_processed: 0,
@@ -846,6 +852,49 @@ impl MatcherState {
             state_commit_failures: 0,
             mids: MidWindow::default(),
         }
+    }
+
+    /// Explicit legacy mode for callers that require the original semantics.
+    pub fn synthetic_legacy() -> Self { Self::new() }
+
+    /// Explicit genesis funding for spot simulation. No external assets move.
+    pub fn funded_simulation(config: FundingConfig) -> Result<Self, LedgerError> {
+        let mut state = Self::new();
+        state.ledger = Ledger::funded(config)?;
+        Ok(state)
+    }
+
+    /// Replay with the same committed simulated genesis and log session.
+    pub fn replaying_funded_simulation(session: &str, config: FundingConfig) -> Result<Self, LedgerError> {
+        let mut state = Self::funded_simulation(config)?;
+        state.feed_session = (!session.is_empty()).then(|| session.to_string());
+        Ok(state)
+    }
+
+    pub fn ledger_snapshot(&self) -> LedgerSnapshot { self.ledger.snapshot() }
+    pub fn ledger_canonical_bytes(&self) -> Vec<u8> { self.ledger.canonical_bytes() }
+
+    /// Store recovery hook: call after restoring books/cursor, before root
+    /// validation or admitting a command. B owns the versioned root/schema.
+    pub fn restore_ledger(&mut self, snapshot: LedgerSnapshot) -> Result<(), LedgerError> {
+        if snapshot.last_sequence != self.last_seen {
+            return Err(LedgerError("ledger cursor differs from matcher cursor".into()));
+        }
+        let restored = Ledger::from_snapshot(snapshot)?;
+        let mut rows = Vec::new();
+        for (symbol, book) in &self.books {
+            for (side, levels) in [(Side::Buy, &book.bids), (Side::Sell, &book.asks)] {
+                for (&price_cents, level) in levels {
+                    for resting in level {
+                        rows.push(OrderRow { order_id: resting.id, account: resting.account,
+                            symbol: symbol.clone(), side, price_cents, qty_tenths: resting.qty_tenths });
+                    }
+                }
+            }
+        }
+        restored.validate_obligations(&rows)?;
+        self.ledger = restored;
+        Ok(())
     }
 
     /// An empty engine that replays the log `session` names.
@@ -1073,6 +1122,10 @@ impl MatcherState {
         }
 
         state.recent_messages = snapshot.recent.into_iter().collect();
+        // Explicit legacy state until a versioned funded snapshot is restored.
+        let mut ledger = state.ledger.snapshot();
+        ledger.last_sequence = state.last_seen;
+        state.ledger = Ledger::from_snapshot(ledger).expect("legacy synthetic snapshot");
         state
     }
 
@@ -1529,6 +1582,7 @@ impl MatcherState {
                 }
             },
         }
+        self.ledger.finish_sequence(msg.id()).expect("matcher and ledger share the checked sequence");
         self.last_seen = msg.id();
         self.messages_processed = self.messages_processed.saturating_add(1);
         // The chain hashes every message the engine consumed, in order. So this
@@ -1953,11 +2007,23 @@ impl MatcherState {
             return;
         }
 
+        // Validate all funded fills and all affected positions before the
+        // first reserve/book/trade effect, including IOC and same-account fills.
+        if let Err(why) = funded::preflight(&order, book, &self.positions, &self.ledger, self.trades_total) {
+            self.prune_book(symbol);
+            self.ignore_order(id, &why);
+            return;
+        }
+        self.ledger.reserve(id, account, symbol, side, order.limit_cents, order.qty_tenths)
+            .expect("complete funded plan accepted reservation");
+
         // Step 5: match against the book. Nobody owns this step, and nothing
         // is added to it. It gets the book and the records a fill changes, and
         // nothing else the exchange holds.
         let mut into = BookAndTrades {
             book,
+            ledger: &mut self.ledger,
+            ledger_plan_committed: false,
             open_orders: &mut self.open_orders,
             positions: &mut self.positions,
             aggregates: &mut self.aggregates,
@@ -1969,6 +2035,7 @@ impl MatcherState {
         let remaining = match step5_match_against_book::execute(&order, &mut into) {
             Matched::Crossed { remaining_tenths } => remaining_tenths,
             Matched::Overflowed { remaining_tenths } => {
+                self.ledger.release(id).expect("release checked order obligation");
                 self.count_ignored(POSITION_OVERFLOW);
                 error!(
                     "order {} stopped with {} tenths unfilled: booking the next fill at {} \
@@ -2024,7 +2091,9 @@ impl MatcherState {
                     );
                 }
                 // Nothing waits in the book. The sender keeps only what filled.
-                Remainder::Cancel => {}
+                Remainder::Cancel => {
+                    into.ledger.release(order.id).expect("release checked remainder");
+                }
             }
         }
         // The entry above is created before the match runs. So an order that
@@ -2266,6 +2335,7 @@ impl MatcherState {
                 let mut cancelled = 0u64;
                 for level in book.bids.values().chain(book.asks.values()) {
                     for resting in level {
+                        self.ledger.release(resting.id).expect("release checked delisted obligation");
                         self.open_orders.remove(&resting.id);
                         Self::record(
                             &mut self.pending,
@@ -2354,6 +2424,7 @@ impl MatcherState {
             );
             return;
         }
+        self.ledger.release(target_id).expect("release checked cancelled obligation");
         let order_ref = self
             .open_orders
             .remove(&target_id)
@@ -2474,6 +2545,12 @@ pub struct MatcherOptions {
 /// stopped. Without one it starts empty. Then it runs the log again from its
 /// first message, and it depends on the sequencer still holding that message.
 pub async fn start_matcher(options: MatcherOptions) {
+    start_matcher_with_ledger(options, Ledger::synthetic_legacy()).await;
+}
+
+/// Explicit simulated execution mode. Durable funded startup is fenced until
+/// the store owner connects the snapshot/root payload in the integrated build.
+pub async fn start_matcher_with_ledger(options: MatcherOptions, ledger: Ledger) {
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
         .finish();
@@ -2491,7 +2568,13 @@ pub async fn start_matcher(options: MatcherOptions) {
         public_inbox_url,
     } = options;
 
+    if ledger.is_funded() && state_db.is_some() {
+        error!("funded simulation requires --no-state-db until versioned ledger persistence is connected");
+        std::process::exit(2);
+    }
     let (mut store, mut state) = open_state(&state_db, &feed_url, poll_ms, reset_state);
+    if ledger.is_funded() { state.ledger = ledger; }
+    info!("simulation ledger mode: {:?}", state.ledger.mode());
     state.validators_configured = validators.len();
     // The key this engine signs its execution claims with. The key sits next to
     // the state it makes claims about: `state.db` gets `state.key`. The
@@ -2585,6 +2668,7 @@ pub async fn start_matcher(options: MatcherOptions) {
             .route("/open-orders", get(get_open_orders))
             .route("/trades", get(get_trades))
             .route("/positions", get(get_positions))
+            .route("/balances", get(get_balances))
             .route("/pnl", get(get_pnl))
             .route("/messages", get(get_messages))
             .route("/candles", get(get_candles))
@@ -3698,6 +3782,7 @@ impl Poller {
                 state.matcher_pubkey.clone(),
             )
         };
+        let funding_config = lock_state(&self.state).ledger.config().cloned();
         let mut fresh = match &mut self.store {
             Some(store) => {
                 if let Err(e) = store.start_new_run(status::FEED_RESTARTED, &self.feed_url) {
@@ -3726,6 +3811,9 @@ impl Poller {
             None => MatcherState::new(),
         };
         fresh.feed_session = session.map(String::from);
+        if let Some(config) = funding_config {
+            fresh.ledger = Ledger::funded(config).expect("previously validated simulated genesis");
+        }
         fresh.feed_pubkey = pinned;
         fresh.validators_configured = validators_configured;
         // The claim key belongs to the engine and not to one run. The same key
@@ -3955,6 +4043,8 @@ struct MarketSymbol {
 /// for each symbol.
 #[derive(Serialize)]
 struct MarketResponse {
+    ledger_mode: LedgerMode,
+    asset_scale: i64,
     last_feed_id: OrderId,
     messages_processed: u64,
     total_trades: u64,
@@ -4060,6 +4150,11 @@ struct MarketResponse {
     symbols: Vec<MarketSymbol>,
 }
 
+/// Whole-unit ledger snapshot: mode, funding, balances and active reserves.
+async fn get_balances(State(state): State<Arc<Mutex<MatcherState>>>) -> Json<LedgerSnapshot> {
+    Json(lock_state(&state).ledger_snapshot())
+}
+
 /// Answers GET /market with the current state of every symbol.
 async fn get_market(State(state): State<Arc<Mutex<MatcherState>>>) -> Json<MarketResponse> {
     let state = lock_state(&state);
@@ -4104,6 +4199,8 @@ async fn get_market(State(state): State<Arc<Mutex<MatcherState>>>) -> Json<Marke
         })
         .collect();
     Json(MarketResponse {
+        ledger_mode: state.ledger.mode(),
+        asset_scale: crate::ledger::ASSET_SCALE,
         last_feed_id: state.last_seen,
         messages_processed: state.messages_processed,
         total_trades: state.trades_total,

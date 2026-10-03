@@ -1,5 +1,11 @@
 # Exchange services
 
+The matcher requires an explicit simulation mode. Use `--ledger-mode
+funded-simulation --funding funding.example.json --no-state-db` for financed
+spot balances, or `--ledger-mode synthetic-legacy` for the original PnL demo.
+See [funding, units and balance API](../docs/SPOT-SIMULATION.md). No mode moves
+real funds or provides custody.
+
 One binary starts one service per invocation. The sequencer uses port 3000. The
 exchange uses port 3001 and serves the trading UI. The separate service uses
 port 3002, and validators use ports 3010 and above. The same binary also starts

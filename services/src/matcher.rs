@@ -80,8 +80,8 @@ use sha2::{Digest, Sha256};
 //
 // The function signatures carry that table. A step that changes nothing takes
 // `&`. The two steps that change something say so in what they take or return.
-// Step 5 is owned by nobody, and nothing else may be added to it. See its
-// module comment.
+// Step 5 stages FOK accounting before execution; the independent checker
+// keeps its own matching and all-or-none rules.
 //
 // Step 4 refuses an arriving order that would trade against a resting order of
 // the same account. It did nothing when these files were first split. The file
@@ -346,10 +346,19 @@ impl SymbolRegistry {
 }
 
 /// The name `/market` counts an order under when the account's position cannot
-/// hold the next fill. No step refuses such an order: step 5 has already booked
-/// the earlier fills. So the name lives here and not in a step module.
+/// hold the next fill. FOK refuses its entire staged plan; other order types
+/// can stop after earlier fills. Trade-ID exhaustion also refuses execution.
 const POSITION_OVERFLOW: &str = "position_overflow";
 
+/// One planned fill in matching order, using cents, tenths and integer IDs.
+/// Ledger staging must consume the same slice, including repeated accounts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlannedFill {
+    pub(crate) maker_order: OrderId,
+    pub(crate) maker_account: AccountId,
+    pub(crate) price_cents: i64,
+    pub(crate) qty_tenths: i64,
+}
 /// An open order that waits in the book until the other side trades with it.
 /// Its price is the key of the price level that holds it.
 #[derive(Debug, Clone)]
@@ -465,14 +474,15 @@ impl Position {
         } else {
             // The fill closes open quantity. Any quantity beyond that turns
             // the position to the other side.
-            let open_abs = open.checked_abs()?;
-            let closed = qty_tenths.min(open_abs);
-            // Split the cost in proportion, and divide last to limit rounding.
+            let open_abs = open.unsigned_abs() as i128;
+            let closed = i64::try_from((qty_tenths as i128).min(open_abs)).ok()?;
+            // Allocate proportional basis by truncating toward zero to whole
+            // mills. The unallocated remainder stays with the open position;
+            // a full close consumes all remaining basis. No cash is rounded.
             // The answer is never larger than the cost it came from, so it
             // fits i64 whenever the cost does.
             let closed_basis =
-                i64::try_from(self.cost_basis_mills as i128 * closed as i128 / open_abs as i128)
-                    .ok()?;
+                i64::try_from(self.cost_basis_mills as i128 * closed as i128 / open_abs).ok()?;
             let closed_proceeds = closed.checked_mul(price_cents)?;
             let realized_delta = if open > 0 {
                 closed_proceeds.checked_sub(closed_basis)?
@@ -514,8 +524,9 @@ impl Position {
     /// So a division by the open tenths gives cents, and a division by 100 turns
     /// cents into USDC.
     fn avg_entry_price(&self) -> Option<f64> {
-        (self.net_qty_tenths != 0)
-            .then(|| self.cost_basis_mills as f64 / self.net_qty_tenths.abs() as f64 / 100.0)
+        (self.net_qty_tenths != 0).then(|| {
+            self.cost_basis_mills as f64 / self.net_qty_tenths.unsigned_abs() as f64 / 100.0
+        })
     }
 
     /// The profit the open quantity would book if it closed at `at_cents`.
@@ -1953,9 +1964,28 @@ impl MatcherState {
             return;
         }
 
-        // Step 5: match against the book. Nobody owns this step, and nothing
-        // is added to it. It gets the book and the records a fill changes, and
-        // nothing else the exchange holds.
+        // Stage FOK after effective price and ownership checks, before any
+        // execution effect. Settlement must validate this same plan using
+        // `plan.fills()` before execute_fok consumes it.
+        let staged_fok = if matches!(order.time_in_force, crate::domain::TimeInForce::FillOrKill) {
+            match step5_match_against_book::stage_fok(
+                &order,
+                book,
+                &self.positions,
+                self.trades_total,
+            ) {
+                Ok(plan) => Some(plan),
+                Err(why) => {
+                    self.prune_book(symbol);
+                    self.ignore_order(id, &why);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        // Step 5: commit the staged FOK, or match a non-FOK per fill.
         let mut into = BookAndTrades {
             book,
             open_orders: &mut self.open_orders,
@@ -1966,7 +1996,11 @@ impl MatcherState {
             candle_cache: &mut self.candle_cache,
             pending: &mut self.pending,
         };
-        let remaining = match step5_match_against_book::execute(&order, &mut into) {
+        let matched = match staged_fok {
+            Some(plan) => step5_match_against_book::execute_fok(&order, plan, &mut into),
+            None => step5_match_against_book::execute(&order, &mut into),
+        };
+        let remaining = match matched {
             Matched::Crossed { remaining_tenths } => remaining_tenths,
             Matched::Overflowed { remaining_tenths } => {
                 self.count_ignored(POSITION_OVERFLOW);
@@ -11914,5 +11948,508 @@ mod tests {
             }
         }
         println!();
+    }
+}
+
+#[cfg(test)]
+mod atomic_fok_tests {
+    use super::*;
+    use crate::domain::{OrderType, TimeInForce};
+
+    fn submit(
+        state: &mut MatcherState,
+        id: u64,
+        account: AccountId,
+        side: Side,
+        price: f64,
+        quantity: f64,
+        tif: TimeInForce,
+    ) {
+        state
+            .apply_message(&OrderMessage::New {
+                id,
+                timestamp: id,
+                account,
+                symbol: "ETH-USDC".into(),
+                side,
+                price,
+                quantity,
+                nonce: None,
+                order_type: OrderType::Limit,
+                time_in_force: tif,
+                post_only: false,
+            })
+            .unwrap();
+    }
+
+    fn large_position() -> MatcherState {
+        let mut state = MatcherState::with_default_listings();
+        for n in 0..9 {
+            submit(
+                &mut state,
+                2 * n + 1,
+                7,
+                Side::Sell,
+                10_000_000.0,
+                100_000_000.0,
+                TimeInForce::GoodTillCancel,
+            );
+            submit(
+                &mut state,
+                2 * n + 2,
+                9,
+                Side::Buy,
+                10_000_000.0,
+                100_000_000.0,
+                TimeInForce::GoodTillCancel,
+            );
+        }
+        state
+    }
+
+    fn execution_state(
+        state: &MatcherState,
+    ) -> (
+        String,
+        HashMap<(AccountId, String), Position>,
+        String,
+        String,
+        u64,
+    ) {
+        (
+            format!("{:?}", state.books),
+            state.positions.clone(),
+            format!("{:?}", state.aggregates),
+            serde_json::to_string(&state.trades).unwrap(),
+            state.trades_total,
+        )
+    }
+
+    #[test]
+    fn fok_late_taker_overflow_leaves_all_execution_state_intact() {
+        let mut state = large_position();
+        submit(
+            &mut state,
+            19,
+            21,
+            Side::Sell,
+            10_000_000.0,
+            10_000_000.0,
+            TimeInForce::GoodTillCancel,
+        );
+        submit(
+            &mut state,
+            20,
+            22,
+            Side::Sell,
+            10_000_000.0,
+            20_000_000.0,
+            TimeInForce::GoodTillCancel,
+        );
+        let before = execution_state(&state);
+        state.pending = Some(Vec::new());
+        submit(
+            &mut state,
+            21,
+            9,
+            Side::Buy,
+            10_000_000.0,
+            30_000_000.0,
+            TimeInForce::FillOrKill,
+        );
+        assert_eq!(execution_state(&state), before);
+        assert_eq!(state.open_order(19).unwrap().3, 100_000_000);
+        assert_eq!(state.open_order(20).unwrap().3, 200_000_000);
+        assert!(state.open_order(21).is_none());
+        assert_eq!(
+            state.orders_ignored_by_kind.get(POSITION_OVERFLOW),
+            Some(&1)
+        );
+        assert!(
+            !state
+                .pending
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|change| matches!(
+                    change,
+                    Change::Traded(_) | Change::OrderClosed { .. } | Change::OrderReduced { .. }
+                ))
+        );
+    }
+
+    #[test]
+    fn fok_repeated_maker_overflow_checks_cumulative_fills() {
+        let mut state = large_position();
+        // Each maker fill fits against the original 9e18 cash. Together they
+        // do not; staging must carry account 7's first fill into the second.
+        submit(
+            &mut state,
+            19,
+            7,
+            Side::Sell,
+            10_000_000.0,
+            10_000_000.0,
+            TimeInForce::GoodTillCancel,
+        );
+        submit(
+            &mut state,
+            20,
+            7,
+            Side::Sell,
+            10_000_000.0,
+            20_000_000.0,
+            TimeInForce::GoodTillCancel,
+        );
+        let before = execution_state(&state);
+        submit(
+            &mut state,
+            21,
+            12,
+            Side::Buy,
+            10_000_000.0,
+            30_000_000.0,
+            TimeInForce::FillOrKill,
+        );
+        assert_eq!(execution_state(&state), before);
+        assert_eq!(
+            state.orders_ignored_by_kind.get(POSITION_OVERFLOW),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn fok_self_match_chains_both_legs_for_each_repeated_fill() {
+        let mut state = MatcherState::with_default_listings();
+        submit(
+            &mut state,
+            1,
+            9,
+            Side::Sell,
+            0.01,
+            1.0,
+            TimeInForce::GoodTillCancel,
+        );
+        submit(
+            &mut state,
+            2,
+            9,
+            Side::Sell,
+            0.01,
+            1.0,
+            TimeInForce::GoodTillCancel,
+        );
+        let position = Position {
+            cash_mills: i64::MAX - 15,
+            ..Position::default()
+        };
+        state.positions.insert((9, "ETH-USDC".into()), position);
+        submit(
+            &mut state,
+            3,
+            9,
+            Side::Buy,
+            0.01,
+            2.0,
+            TimeInForce::FillOrKill,
+        );
+        assert_eq!(state.trades_total, 2);
+        assert_eq!(state.positions[&(9, "ETH-USDC".into())], position);
+        assert!(state.open_orders.is_empty());
+    }
+
+    #[test]
+    fn fok_late_self_match_intermediate_overflow_rejects_every_fill() {
+        let mut state = MatcherState::with_default_listings();
+        submit(
+            &mut state,
+            1,
+            7,
+            Side::Sell,
+            0.01,
+            1.0,
+            TimeInForce::GoodTillCancel,
+        );
+        submit(
+            &mut state,
+            2,
+            9,
+            Side::Sell,
+            0.01,
+            3.0,
+            TimeInForce::GoodTillCancel,
+        );
+        state.positions.insert(
+            (9, "ETH-USDC".into()),
+            Position {
+                cash_mills: i64::MAX - 15,
+                ..Position::default()
+            },
+        );
+        let before = execution_state(&state);
+        submit(
+            &mut state,
+            3,
+            9,
+            Side::Buy,
+            0.01,
+            4.0,
+            TimeInForce::FillOrKill,
+        );
+        assert_eq!(execution_state(&state), before);
+        assert_eq!(
+            state.orders_ignored_by_kind.get(POSITION_OVERFLOW),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn fok_commits_price_time_plan_and_conserves_cash_and_quantity() {
+        let mut state = MatcherState::with_default_listings();
+        for (id, account, price, quantity) in [
+            (1, 7, 100.0, 1.0),
+            (2, 7, 100.0, 2.0),
+            (3, 9, 101.0, 1.0),
+            (4, 8, 101.0, 2.0),
+        ] {
+            submit(
+                &mut state,
+                id,
+                account,
+                Side::Sell,
+                price,
+                quantity,
+                TimeInForce::GoodTillCancel,
+            );
+        }
+        submit(
+            &mut state,
+            5,
+            9,
+            Side::Buy,
+            101.0,
+            5.0,
+            TimeInForce::FillOrKill,
+        );
+        assert_eq!(state.trades_total, 4);
+        assert_eq!(
+            state
+                .trades
+                .iter()
+                .map(|trade| trade.maker_order)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(state.open_order(4).unwrap().3, 10);
+        assert!(state.open_order(5).is_none());
+        assert_eq!(
+            state
+                .positions
+                .values()
+                .map(|p| p.net_qty_tenths as i128)
+                .sum::<i128>(),
+            0
+        );
+        assert_eq!(
+            state
+                .positions
+                .values()
+                .map(|p| p.cash_mills as i128)
+                .sum::<i128>(),
+            0
+        );
+        assert_eq!(state.position_of(7, "ETH-USDC").2, 300_000);
+        assert_eq!(state.position_of(8, "ETH-USDC").2, 101_000);
+        assert_eq!(state.position_of(9, "ETH-USDC").2, -401_000);
+    }
+
+    #[test]
+    fn fok_trade_id_exhaustion_is_preflighted_before_the_first_fill() {
+        let mut state = MatcherState::with_default_listings();
+        submit(
+            &mut state,
+            1,
+            7,
+            Side::Sell,
+            100.0,
+            1.0,
+            TimeInForce::GoodTillCancel,
+        );
+        submit(
+            &mut state,
+            2,
+            8,
+            Side::Sell,
+            100.0,
+            1.0,
+            TimeInForce::GoodTillCancel,
+        );
+        state.trades_total = u64::MAX - 1;
+        let before = execution_state(&state);
+        submit(
+            &mut state,
+            3,
+            9,
+            Side::Buy,
+            100.0,
+            2.0,
+            TimeInForce::FillOrKill,
+        );
+        assert_eq!(execution_state(&state), before);
+        assert_eq!(
+            state.orders_ignored_by_kind.get(POSITION_OVERFLOW),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn fok_sell_plan_uses_best_bid_then_fifo() {
+        let mut state = MatcherState::with_default_listings();
+        for (id, account, price) in [(1, 7, 100.0), (2, 8, 101.0), (3, 7, 101.0)] {
+            submit(
+                &mut state,
+                id,
+                account,
+                Side::Buy,
+                price,
+                1.0,
+                TimeInForce::GoodTillCancel,
+            );
+        }
+        submit(
+            &mut state,
+            4,
+            9,
+            Side::Sell,
+            100.0,
+            2.5,
+            TimeInForce::FillOrKill,
+        );
+        assert_eq!(
+            state
+                .trades
+                .iter()
+                .map(|trade| trade.maker_order)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 1]
+        );
+        assert_eq!(state.open_order(1).unwrap().3, 5);
+        assert_eq!(
+            state
+                .positions
+                .values()
+                .map(|p| p.net_qty_tenths as i128)
+                .sum::<i128>(),
+            0
+        );
+        assert_eq!(
+            state
+                .positions
+                .values()
+                .map(|p| p.cash_mills as i128)
+                .sum::<i128>(),
+            0
+        );
+    }
+
+    #[test]
+    fn external_validation_can_reject_the_complete_fok_plan_without_effects() {
+        let mut state = MatcherState::with_default_listings();
+        submit(
+            &mut state,
+            1,
+            7,
+            Side::Sell,
+            100.0,
+            1.0,
+            TimeInForce::GoodTillCancel,
+        );
+        submit(
+            &mut state,
+            2,
+            7,
+            Side::Sell,
+            101.0,
+            1.0,
+            TimeInForce::GoodTillCancel,
+        );
+        let before = execution_state(&state);
+        let incoming = IncomingOrder {
+            id: 3,
+            timestamp: 3,
+            account: 9,
+            symbol: "ETH-USDC".into(),
+            side: Side::Buy,
+            limit_cents: 10_100,
+            qty_tenths: 20,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::FillOrKill,
+            post_only: false,
+        };
+        let plan = step5_match_against_book::stage_fok(
+            &incoming,
+            &state.books["ETH-USDC"],
+            &state.positions,
+            state.trades_total,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.fills()
+                .iter()
+                .map(|fill| (
+                    fill.maker_order,
+                    fill.maker_account,
+                    fill.price_cents,
+                    fill.qty_tenths
+                ))
+                .collect::<Vec<_>>(),
+            vec![(1, 7, 10_000, 10), (2, 7, 10_100, 10)]
+        );
+        // Model only the external validator's rejection boundary, not a spot
+        // ledger: it sees BOTH planned fills before execute_fok may run.
+        let result = plan.fills().iter().try_fold(100_000i64, |available, fill| {
+            available
+                .checked_sub(fill.price_cents.checked_mul(fill.qty_tenths)?)
+                .filter(|left| *left >= 0)
+        });
+        assert!(
+            result.is_none(),
+            "the second planned fill exceeds this validator's budget"
+        );
+        drop(plan);
+        assert_eq!(execution_state(&state), before);
+    }
+    #[test]
+    fn proportional_basis_keeps_mill_remainder_until_full_close() {
+        let position = Position {
+            net_qty_tenths: 3,
+            cash_mills: -10,
+            cost_basis_mills: 10,
+            realized_mills: 0,
+        };
+        let partial = position.after_fill(Side::Sell, 1, 4).unwrap();
+        assert_eq!(partial.cost_basis_mills, 7);
+        assert_eq!(partial.realized_mills, 1);
+        let closed = partial.after_fill(Side::Sell, 2, 4).unwrap();
+        assert_eq!(closed.cost_basis_mills, 0);
+        assert_eq!(closed.net_qty_tenths, 0);
+        assert_eq!(closed.realized_mills, 2);
+        assert_eq!(closed.cash_mills, 2);
+    }
+
+    #[test]
+    fn smallest_signed_quantity_can_be_valued_and_partially_closed() {
+        let position = Position {
+            net_qty_tenths: i64::MIN,
+            cash_mills: 0,
+            cost_basis_mills: i64::MAX,
+            realized_mills: 0,
+        };
+        assert!(position.avg_entry_price().unwrap().is_finite());
+        let closed = position.after_fill(Side::Buy, 1, 1).unwrap();
+        assert_eq!(closed.net_qty_tenths, i64::MIN + 1);
+        assert_eq!(closed.cash_mills, -1);
+        assert_eq!(closed.cost_basis_mills, i64::MAX);
+        assert_eq!(closed.realized_mills, -1);
     }
 }

@@ -250,3 +250,40 @@ async fn recovery_disk_failure_never_publishes_or_admits_another_batch() {
     );
     assert_eq!(lock_state(&poller.state).state_commit_failures, 1);
 }
+
+#[tokio::test]
+async fn recovery_failed_stop_pauses_and_does_not_mark_the_run_saved() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("state.db");
+    let (store, _) = Store::open(&path, "http://local", 200, false).unwrap();
+    let state = MatcherState::recording(&store);
+    let root = state.state_root();
+    let committed = state.counters();
+    let (_, shutdown) = watch::channel(false);
+    let mut poller = Poller {
+        state: Arc::new(Mutex::new(state)),
+        live: LiveFeed::new(),
+        feed_url: "http://local".into(),
+        poll_ms: 200,
+        store: Some(store),
+        shutdown,
+        committed,
+        committed_root: root,
+        claim_key: SigningKey::from_bytes(&[46; 32]),
+        last_heartbeat: Instant::now(),
+    };
+    poller.store.as_mut().unwrap().fail_writes_for_test();
+    poller.finish().await;
+    let state = lock_state(&poller.state);
+    assert!(state.execution_paused);
+    assert_eq!(state.state_commit_failures, 1);
+    assert_eq!(state.state_root(), root);
+    drop(state);
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let status: String = connection
+        .query_row("SELECT status FROM runs WHERE run_id=1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(status, crate::store::status::OPEN);
+}

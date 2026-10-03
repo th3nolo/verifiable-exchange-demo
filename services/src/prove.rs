@@ -756,6 +756,15 @@ struct ClaimsPage {
 
 fn legacy_root_version() -> u32 { 4 }
 
+#[cfg(test)]
+mod root_version_regressions {
+    #[test]
+    fn recovery_replay_verifies_explicit_legacy_v4_and_current_v5_claims() {
+        super::Replay::regression_claim_version(4);
+        super::Replay::regression_claim_version(5);
+    }
+}
+
 /// One claim as served. In hex, like everything else on the wire here.
 #[derive(Debug, serde::Deserialize)]
 struct WireClaim {
@@ -1157,6 +1166,28 @@ struct Replay {
 }
 
 impl Replay {
+    #[cfg(test)]
+    fn regression_claim_version(version: u32) {
+        let session = "root-version-regression";
+        let msg = OrderMessage::New { id: 1, timestamp: 0, account: 1, symbol: "UNLISTED".into(),
+            side: crate::domain::Side::Buy, price: 99.0, quantity: 1.0, nonce: None,
+            order_type: Default::default(), time_in_force: Default::default(), post_only: false };
+        let bytes = logchain::canonical_bytes(&msg);
+        let mut body = bytes; body.push(b'\n');
+        let raw = crate::wire::split_ndjson(&body).unwrap().pop().unwrap();
+        let mut engine = MatcherState::replaying(session);
+        let before = engine.state_root_for_version(version);
+        engine.apply_received(&raw, &msg).unwrap();
+        let after = engine.state_root_for_version(version);
+        let mut replay = Self::new(None, Vec::new(), session);
+        replay.root_version = version;
+        replay.push_claims(vec![ClaimRow { from_msg: 1, to_msg: 1, root_before: before,
+            root_after: after, trades_total: 0, signature: None }]);
+        replay.apply(&raw);
+        assert_eq!(replay.roots.failed, 0, "root v{version}: {:?}", replay.roots.failures);
+        assert_eq!(replay.totals.failed, 0);
+        assert_eq!(replay.boundaries_checked, 2);
+    }
     /// `session` names the log under re-execution, and the re-execution needs
     /// the name. The operator signs an operator message over a statement whose
     /// second line is the session. An exchange that does not know the session

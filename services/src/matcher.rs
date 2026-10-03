@@ -32,7 +32,7 @@ use crate::logchain::{self, AttestStatus, Chain, EMPTY_CHAIN, StateRoot};
 use crate::operator::{self, valid_symbol};
 use crate::store::{
     Change, ClaimRow, Counters, ExecutionState, HistoryReader, ListingRow, OrderRow, Snapshot, Store, StoreError,
-    status,
+    TradeRow, status,
 };
 use crate::wire::{self, RawMessage, ReadMessage, TooOld};
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
@@ -110,6 +110,7 @@ mod recovery_tests;
 mod funded;
 mod pipeline;
 mod reference_price;
+mod resource_limits;
 mod step1_resolve_symbol;
 mod step2_validate_order_type;
 mod step3_bound_the_price;
@@ -119,6 +120,7 @@ mod step6_remainder_policy;
 
 use pipeline::{IncomingOrder, Rejected, RuleSet, Terms};
 use reference_price::MidWindow;
+pub use resource_limits::{RESOURCE_LIMITS_EXTENSION, ResourceLimits};
 use step5_match_against_book::{BookAndTrades, Matched};
 use step6_remainder_policy::Remainder;
 
@@ -623,6 +625,10 @@ impl std::error::Error for ApplyError {}
 pub struct MatcherState {
     execution_extensions: BTreeMap<String, Vec<u8>>,
     execution_paused: bool,
+    /// None is the historical unbounded policy. Bounded execution fixes this
+    /// configuration at genesis; the versioned snapshot/root integration must
+    /// carry resource_limits_snapshot(), not just restore its raw bytes.
+    resource_limits: Option<ResourceLimits>,
     /// Which symbols may be traded, and on what steps. Built from the
     /// `ListSymbol` and `DelistSymbol` messages in the log and from nothing
     /// else. See `SymbolRegistry`. The registry is state that lives across
@@ -823,6 +829,7 @@ impl MatcherState {
         MatcherState {
             execution_extensions: BTreeMap::new(),
             execution_paused: false,
+            resource_limits: None,
             symbols: SymbolRegistry::default(),
             books: HashMap::new(),
             open_orders: HashMap::new(),
@@ -923,6 +930,52 @@ impl MatcherState {
         }
         restored.validate_obligations(&rows)?;
         self.ledger = restored;
+        Ok(())
+    }
+
+    /// Selects a bounded policy at volatile genesis. A recording engine must
+    /// carry this policy in its versioned snapshot before enabling it.
+    pub fn with_resource_limits(mut self, limits: ResourceLimits) -> Result<Self, String> {
+        limits.validate()?;
+        if self.last_seen != 0 || self.pending.is_some() {
+            return Err("resource limits require volatile genesis; durable configuration must be restored from its versioned snapshot".to_string());
+        }
+        self.resource_limits = Some(limits);
+        Ok(self)
+    }
+
+    pub fn resource_limits(&self) -> Option<ResourceLimits> {
+        self.resource_limits
+    }
+
+    pub fn resource_limits_snapshot(&self) -> Option<Vec<u8>> {
+        self.resource_limits.map(|limits| limits.snapshot_bytes())
+    }
+
+    /// Restore at genesis, before loading counters/orders/trades. Missing
+    /// payload identifies the historical unbounded policy, never new defaults.
+    pub fn restore_resource_limits(&mut self, bytes: Option<&[u8]>) -> Result<(), String> {
+        if self.last_seen != 0 || self.messages_processed != 0 || self.resource_limits.is_some() {
+            return Err(
+                "resource limits must be restored before execution or state loading".to_string(),
+            );
+        }
+        self.resource_limits = bytes.map(ResourceLimits::from_snapshot_bytes).transpose()?;
+        Ok(())
+    }
+
+    /// Check reconstructed state before root comparison and new admission.
+    pub fn validate_resource_capacity(&self) -> Result<(), String> {
+        if let Some(limits) = self.resource_limits {
+            if self.open_orders.len() as u64 > limits.max_active_orders
+                || self.positions.len() as u64 > limits.max_positions
+                || self.symbols.symbols.len() as u64 > limits.max_symbols
+            {
+                return Err(
+                    "restored execution state exceeds its committed resource limits".to_string(),
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1483,6 +1536,42 @@ impl MatcherState {
         self.apply_inner(msg, None)
     }
 
+    /// Runs one message and returns every fill it produced, in execution order.
+    /// This batch is independent of the bounded recent-trade window. Durable
+    /// changes already queued stay queued; a volatile engine collects changes
+    /// only for this call and releases them before returning.
+    pub fn apply_message_with_trades(
+        &mut self,
+        msg: &OrderMessage,
+    ) -> Result<Vec<TradeRow>, ApplyError> {
+        let recording = self.pending.is_some();
+        let start = self.pending.as_ref().map_or(0, Vec::len);
+        if !recording {
+            self.pending = Some(Vec::new());
+        }
+        let result = self.apply_message(msg);
+        let trades = if recording {
+            self.pending.as_ref().expect("recording changes")[start..]
+                .iter()
+                .filter_map(|change| match change {
+                    Change::Traded(trade) => Some(trade.clone()),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            self.pending
+                .take()
+                .expect("temporary changes")
+                .into_iter()
+                .filter_map(|change| match change {
+                    Change::Traded(trade) => Some(trade),
+                    _ => None,
+                })
+                .collect()
+        };
+        result.map(|()| trades)
+    }
+
     /// Runs one message the sequencer served, and hashes the bytes it served.
     ///
     /// `raw.bytes` and `msg` are the same message twice: the bytes to hash, and
@@ -2023,6 +2112,22 @@ impl MatcherState {
             post_only: terms.post_only,
         };
 
+        if let Some(limits) = self.resource_limits {
+            if self.open_orders.len() as u64 >= limits.max_active_orders {
+                self.ignore_order(
+                    id,
+                    &Rejected::because(
+                        "active_order_capacity",
+                        format!(
+                            "active order capacity {} is exhausted; cancel an active order first",
+                            limits.max_active_orders
+                        ),
+                    ),
+                );
+                return;
+            }
+        }
+
         // Step 2: validate the order type. The step reads the symbol's book,
         // and no book is created for it. Fill-or-kill needs an answer before
         // step 5 books anything, and post-only needs to know whether the order
@@ -2072,6 +2177,14 @@ impl MatcherState {
             return;
         }
 
+        // Apply the committed admission policy before any reservation or fill.
+        if let Some(limits) = self.resource_limits {
+            if let Err(why) = limits.check_positions(&order, book, &self.positions) {
+                self.prune_book(symbol);
+                self.ignore_order(id, &why);
+                return;
+            }
+        }
         // Stage FOK after effective price and ownership checks, before any
         // execution effect. Settlement must validate this same plan using
         // `plan.fills()` before execute_fok consumes it.
@@ -2375,6 +2488,14 @@ impl MatcherState {
         if let Err(why) = valid_symbol(symbol) {
             self.listings_ignored = self.listings_ignored.saturating_add(1);
             warn!("listing {} ignored: {}", id, why);
+            return;
+        }
+        if self.resource_limits.is_some_and(|limits| {
+            !self.symbols.symbols.contains_key(symbol)
+                && self.symbols.symbols.len() as u64 >= limits.max_symbols
+        }) {
+            self.listings_ignored = self.listings_ignored.saturating_add(1);
+            warn!("listing {} ignored: symbol capacity is exhausted", id);
             return;
         }
         let (Some(price_step_cents), Some(quantity_step_tenths)) =

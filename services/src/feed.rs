@@ -1,6 +1,8 @@
 mod cache;
 mod db;
 mod drain;
+mod retention;
+pub use retention::RetentionLimits;
 mod generate;
 mod http;
 mod limit;
@@ -119,6 +121,38 @@ pub async fn start_feed(
     trusted_proxies: TrustedProxies,
     operator_key: Option<VerifyingKey>,
 ) {
+    start_feed_with_retention_limits(
+        bind,
+        port,
+        num_accounts,
+        rate,
+        db,
+        inbox_url,
+        ui_origins,
+        trusted_proxies,
+        operator_key,
+        RetentionLimits::default(),
+    )
+    .await;
+}
+
+/// Starts the feed with explicit operational retention/admission budgets.
+pub async fn start_feed_with_retention_limits(
+    bind: IpAddr,
+    port: u16,
+    num_accounts: u32,
+    rate: f64,
+    db: Option<PathBuf>,
+    inbox_url: Option<String>,
+    ui_origins: Vec<String>,
+    trusted_proxies: TrustedProxies,
+    operator_key: Option<VerifyingKey>,
+    limits: RetentionLimits,
+) {
+    if let Err(detail) = limits.validate() {
+        eprintln!("invalid feed retention limits: {}", detail);
+        std::process::exit(2);
+    }
     // The subscriber prints the log lines this process writes.
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
@@ -168,7 +202,13 @@ pub async fn start_feed(
                     std::process::exit(2);
                 }
             };
-            match FeedState::with_db(num_accounts, path, signing_key, wall_base_ms) {
+            match FeedState::with_db_and_retention_limits(
+                num_accounts,
+                path,
+                signing_key,
+                wall_base_ms,
+                limits,
+            ) {
                 Ok(state) => {
                     info!(
                         "feed database {}: session {}, {} messages verified, the newest {} held \
@@ -198,6 +238,8 @@ pub async fn start_feed(
                  and a restart loses every published message"
             );
             FeedState::new(num_accounts, wall_base_ms)
+                .with_retention_limits(limits)
+                .expect("validated limits on empty feed state")
         }
     };
     info!(
@@ -370,6 +412,7 @@ impl Storage {
 
 /// Everything the sequencer holds at one moment.
 pub struct FeedState {
+    retention_limits: RetentionLimits,
     /// The newest `MESSAGE_WINDOW` messages, in log order. The whole history is
     /// `feed_messages` in the database. This window is the part kept in RAM, so
     /// an ordinary poll is answered without a disk read.
@@ -628,6 +671,7 @@ impl FeedState {
             mids.insert(symbol.to_string(), mid);
         }
         FeedState {
+            retention_limits: RetentionLimits::default(),
             messages: VecDeque::new(),
             chains: VecDeque::new(),
             next_id: 1,
@@ -822,7 +866,47 @@ impl FeedState {
         signing_key: SigningKey,
         wall_base_ms: u64,
     ) -> Result<Self, String> {
+        Self::with_db_and_retention_limits(
+            num_accounts,
+            path,
+            signing_key,
+            wall_base_ms,
+            RetentionLimits::default(),
+        )
+    }
+
+    pub fn with_db_and_retention_limits(
+        num_accounts: u32,
+        path: &Path,
+        signing_key: SigningKey,
+        wall_base_ms: u64,
+        limits: RetentionLimits,
+    ) -> Result<Self, String> {
+        limits.validate()?;
         let mut conn = open_feed_db(path)?;
+        // Refuse before materializing these required historical indexes. Never
+        // start with a partial index or delete records to make a history fit.
+        for (sql, max, name) in [
+            (
+                "SELECT COUNT(*) FROM feed_accounts",
+                limits.max_accounts,
+                "account",
+            ),
+            (
+                "SELECT COUNT(*) FROM inbox_sequenced",
+                limits.max_inbox_records,
+                "inbox record",
+            ),
+        ] {
+            let count: u64 = conn
+                .query_row(sql, [], |row| row.get(0))
+                .map_err(|e| e.to_string())?;
+            if count > max {
+                return Err(format!(
+                    "stored {name} count {count} exceeds capacity {max}; history is retained"
+                ));
+            }
+        }
 
         // How much of the tree this database already holds, before one message
         // is read. These two values decide whether this start has to build any
@@ -834,7 +918,8 @@ impl FeedState {
         // start needs is built up as the rows go past: the chain, the used
         // nonces, the generator's last prices and the orders it can cancel, and
         // the window of recent messages the sequencer serves from memory.
-        // Nothing grows except what `MESSAGE_WINDOW` or the symbol count limits.
+        // Nonce history is checked against capacity as rows arrive. Recent
+        // messages and generator candidates have their own bounded windows.
         let mut messages: VecDeque<Published> = VecDeque::new();
         let mut chains: VecDeque<Chain> = VecDeque::new();
         let mut nonces: HashMap<NonceKey, OrderId> = HashMap::new();
@@ -950,6 +1035,12 @@ impl FeedState {
                             fields.account
                         ));
                     };
+                    if !nonces.contains_key(&key) && nonces.len() as u64 >= limits.max_nonces {
+                        return Err(format!(
+                            "stored nonce count exceeds capacity {}; history is retained",
+                            limits.max_nonces
+                        ));
+                    }
                     if let Some(first) = nonces.insert(key, id) {
                         // Two messages under one `(account, nonce)`. That is the
                         // repeat this whole check exists to stop, and it sits in
@@ -1321,6 +1412,7 @@ impl FeedState {
         }
 
         let mut state = FeedState::new(num_accounts, wall_base_ms);
+        state.retention_limits = limits;
         state.session = session;
         state.chain = chain;
         state.chains = chains;
@@ -1440,6 +1532,15 @@ impl FeedState {
     ) -> Result<(), (StatusCode, String)> {
         let decision = inbox::check_account_key(account, self.accounts.get(&account), key)?;
         if decision == inbox::AccountPin::First {
+            if self.accounts.len() as u64 >= self.retention_limits.max_accounts {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "account capacity {} exhausted; pinned keys are retained",
+                        self.retention_limits.max_accounts
+                    ),
+                ));
+            }
             if let Some(db) = self.storage.conn() {
                 db.execute(
                     "INSERT INTO feed_accounts (account, public_key, pinned_at) VALUES (?1, ?2, ?3)",
@@ -1529,6 +1630,9 @@ impl FeedState {
         if batch.is_empty() {
             return Ok(());
         }
+        // Writers preflight headroom before taking ids. This final guard also
+        // protects internal callers; rejection performs no state mutation.
+        self.check_retention_batch(&batch)?;
         let mut chain = self.chain;
         let mut chains = Vec::with_capacity(batch.len());
         // The message is turned into bytes once, and this is the only place in

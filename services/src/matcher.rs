@@ -7542,6 +7542,7 @@ mod tests {
         let before = engine.state_root();
         let books_before = engine.books.len();
         let chain_before = engine.feed_chain;
+        let ledger_before = engine.ledger_snapshot();
 
         engine
             .apply_message(&new_order_for(4, 7, Side::Sell, 100.0, 4.0))
@@ -7556,13 +7557,21 @@ mod tests {
         );
         assert_eq!(engine.books.len(), books_before);
         // A consumed rejection advances the cursor and authenticated history.
-        // Compare execution state at the same cursor and chain, without
-        // discarding the MidWindow now authenticated by v5.
+        // Compare execution state at the same matcher/ledger cursor and chain,
+        // without discarding the MidWindow now authenticated by v5.
         let after = engine.state_root();
         assert_ne!(after, before, "the cursor moved");
         let chain_after = engine.feed_chain;
+        let ledger_after = engine.ledger_snapshot();
+        let mut comparable_ledger = ledger_after.clone();
+        comparable_ledger.last_sequence = ledger_before.last_sequence;
+        assert_eq!(
+            comparable_ledger, ledger_before,
+            "the refusal changed ledger effects beyond its consumed cursor"
+        );
         engine.last_seen = 3;
         engine.feed_chain = chain_before;
+        engine.restore_ledger(comparable_ledger).unwrap();
         assert_eq!(
             logchain::to_hex(&engine.state_root()),
             logchain::to_hex(&before),
@@ -7575,6 +7584,7 @@ mod tests {
         // an unlisted symbol is used instead.
         engine.last_seen = 4;
         engine.feed_chain = chain_after;
+        engine.restore_ledger(ledger_after).unwrap();
         let unlisted = match new_order_for(5, 7, Side::Buy, 100.0, 5.0) {
             OrderMessage::New {
                 id,
@@ -11315,6 +11325,9 @@ mod tests {
                 let mut empty = MatcherState::new();
                 empty.last_seen = 1;
                 empty.feed_chain = state.feed_chain;
+                let mut consumed_empty_ledger = empty.ledger_snapshot();
+                consumed_empty_ledger.last_sequence = 1;
+                empty.restore_ledger(consumed_empty_ledger).unwrap();
                 empty.state_root()
             })
         );

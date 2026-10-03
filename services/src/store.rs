@@ -1319,6 +1319,9 @@ impl Store {
         let (root_version, blob): (u32, Option<Vec<u8>>) = self.conn.query_row(
             "SELECT root_version, execution_state FROM resume_point WHERE run_id=?1",
             params![run_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        if !matches!(root_version, 4 | 5) {
+            return Err(StoreError::Corrupt(format!("unsupported execution root version {}", root_version)));
+        }
         if root_version != 5 && counters.last_seen > 0 {
             return Err(StoreError::Corrupt(format!("legacy root v{} omitted MidWindow; equivalent recovery is unavailable. Replay into a new run or explicitly reset; historical rows and roots are preserved", root_version)));
         }

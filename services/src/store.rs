@@ -111,7 +111,7 @@ use crate::sqlite;
 ///
 /// Version 12 added the account, account-and-symbol, and symbol trade indexes.
 /// They change no stored fact. They bound filtered reads over a long run.
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 /// A running exchange writes the time into its run row again and again. That
 /// time is the heartbeat. A run whose heartbeat is 30 000 ms old or older
@@ -143,6 +143,7 @@ pub mod status {
 pub enum StoreError {
     /// SQLite itself refused the operation.
     Sql(rusqlite::Error),
+    Fenced,
     /// Another exchange process is running on this database.
     Busy(String),
     /// The stored state contradicts itself. Resuming from it would serve
@@ -164,6 +165,7 @@ pub enum StoreError {
 impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            StoreError::Fenced => write!(f, "store ownership lost: stale writer is fenced"),
             StoreError::Sql(e) => write!(f, "database error: {}", e),
             StoreError::Busy(m) => write!(f, "{}", m),
             StoreError::Corrupt(m) => write!(f, "stored state is inconsistent: {}", m),
@@ -322,6 +324,7 @@ impl Default for Counters {
 /// transaction.
 #[derive(Debug, Clone)]
 pub enum Change {
+    ExecutionState(ExecutionState),
     /// An order did not trade in full. What is left of it now rests in the
     /// book and waits.
     OrderRested(OrderRow),
@@ -374,10 +377,29 @@ pub struct ClaimRow {
     pub signature: Option<[u8; 64]>,
 }
 
+/// Root v5 execution state. Extensions must be deterministic canonical bytes;
+/// the ledger uses them for mode, funding, balances and reservations together.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct MidWindowRow {
+    pub clip_ms: u64,
+    pub samples: Vec<(u64, Option<i64>)>,
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ExecutionState {
+    pub root_version: u32,
+    pub mid_windows: BTreeMap<String, MidWindowRow>,
+    pub extensions: BTreeMap<String, Vec<u8>>,
+}
+impl Default for ExecutionState {
+    fn default() -> Self { Self { root_version: 5, mid_windows: BTreeMap::new(), extensions: BTreeMap::new() } }
+}
 /// Everything the exchange needs to rebuild a `MatcherState`, read back from
 /// one run.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Snapshot {
+    pub execution_state: ExecutionState,
+    pub last_claim: Option<ClaimRow>,
+    pub matcher_pubkey: Option<String>,
     pub counters: Counters,
     /// Resting orders, smallest order id first. That is also the order in
     /// which they trade inside one price level: the order that arrived first
@@ -424,6 +446,7 @@ pub struct Store {
     conn: Connection,
     path: PathBuf,
     run_id: i64,
+    epoch: i64,
 }
 
 fn now_millis() -> u64 {
@@ -449,6 +472,10 @@ fn side_from_text(text: &str) -> Result<Side, StoreError> {
 }
 
 impl Store {
+    #[cfg(test)]
+    pub(crate) fn fail_writes_for_test(&mut self) {
+        self.conn.execute_batch("PRAGMA query_only=ON").expect("read-only fault injection");
+    }
     /// Opens the database at `path`, claims the run left in it, and returns
     /// the state to resume from, if there is one.
     ///
@@ -515,6 +542,7 @@ impl Store {
             conn,
             path: path.to_path_buf(),
             run_id: 0,
+            epoch: 0,
         };
         match store.claim_open_run(grace_ms, reset)? {
             Some(run_id) => {
@@ -527,6 +555,27 @@ impl Store {
                 Ok((store, None))
             }
         }
+    }
+
+    /// Authenticate against the separately held key file, never a key or root
+    /// supplied solely by the mutable database being checked.
+    pub fn authenticate_snapshot(snapshot: &Snapshot, trusted: &ed25519_dalek::VerifyingKey) -> Result<(), StoreError> {
+        if snapshot.counters.last_seen == 0 && snapshot.last_claim.is_none() { return Ok(()); }
+        if snapshot.matcher_pubkey.as_deref() != Some(crate::logchain::to_hex(trusted.as_bytes()).as_str()) {
+            return Err(StoreError::Corrupt("claim key does not match trusted matcher key".into()));
+        }
+        let claim = snapshot.last_claim.as_ref().ok_or_else(|| StoreError::Corrupt("missing last claim".into()))?;
+        if claim.from_msg == 0 || claim.from_msg > claim.to_msg || claim.to_msg != snapshot.counters.last_seen
+            || claim.trades_total != snapshot.trades_total || Some(claim.root_after) != snapshot.last_claim_root {
+            return Err(StoreError::Corrupt("last claim cursor/trade/root bindings disagree with snapshot".into()));
+        }
+        let signature = claim.signature.ok_or_else(|| StoreError::Corrupt("unsigned last claim".into()))?;
+        if !crate::logchain::verify_claim(trusted, snapshot.feed_session.as_deref().unwrap_or_default(),
+            claim.from_msg, claim.to_msg, &claim.root_before, &claim.root_after, claim.trades_total,
+            &ed25519_dalek::Signature::from_bytes(&signature)) {
+            return Err(StoreError::Corrupt("last claim signature does not verify under trusted key".into()));
+        }
+        Ok(())
     }
 
     /// The database file this store writes to.
@@ -554,10 +603,11 @@ impl Store {
     /// resumed. That is what lets an operator tell a `--start-matcher` after a
     /// clean stop apart from a `--start-matcher` after a crash.
     pub fn close_run(&mut self, status: &str) -> Result<(), StoreError> {
-        self.conn.execute(
-            "UPDATE runs SET status = ?2, closed_at = ?3 WHERE run_id = ?1",
-            params![self.run_id, status, now_millis() as i64],
+        let changed = self.conn.execute(
+            "UPDATE runs SET status = ?2, closed_at = ?3 WHERE run_id = ?1 AND epoch = ?4 AND status = 'open'",
+            params![self.run_id, status, now_millis() as i64, self.epoch],
         )?;
+        if changed != 1 { return Err(StoreError::Fenced); }
         Ok(())
     }
 
@@ -570,20 +620,22 @@ impl Store {
     /// messages of. A later resume can then tell whether the sequencer still
     /// serves that same history.
     pub fn set_feed_session(&mut self, session: &str) -> Result<(), StoreError> {
-        self.conn.execute(
-            "UPDATE runs SET feed_session = ?2 WHERE run_id = ?1",
-            params![self.run_id, session],
+        let changed = self.conn.execute(
+            "UPDATE runs SET feed_session = ?2 WHERE run_id = ?1 AND epoch = ?4 AND status = 'open'",
+            params![self.run_id, session, rusqlite::types::Null, self.epoch],
         )?;
+        if changed != 1 { return Err(StoreError::Fenced); }
         Ok(())
     }
 
     /// Records the sequencer's public key this run trusts. The run pinned that
     /// key the first time it read from the sequencer.
     pub fn set_feed_pubkey(&mut self, pubkey: &str) -> Result<(), StoreError> {
-        self.conn.execute(
-            "UPDATE runs SET feed_pubkey = ?2 WHERE run_id = ?1",
-            params![self.run_id, pubkey],
+        let changed = self.conn.execute(
+            "UPDATE runs SET feed_pubkey = ?2 WHERE run_id = ?1 AND epoch = ?4 AND status = 'open'",
+            params![self.run_id, pubkey, rusqlite::types::Null, self.epoch],
         )?;
+        if changed != 1 { return Err(StoreError::Fenced); }
         Ok(())
     }
 
@@ -600,20 +652,22 @@ impl Store {
 
     /// Records the public key this run's execution claims are signed with.
     pub fn set_matcher_pubkey(&mut self, pubkey: &str) -> Result<(), StoreError> {
-        self.conn.execute(
-            "UPDATE runs SET matcher_pubkey = ?2 WHERE run_id = ?1",
-            params![self.run_id, pubkey],
+        let changed = self.conn.execute(
+            "UPDATE runs SET matcher_pubkey = ?2 WHERE run_id = ?1 AND epoch = ?4 AND status = 'open'",
+            params![self.run_id, pubkey, rusqlite::types::Null, self.epoch],
         )?;
+        if changed != 1 { return Err(StoreError::Fenced); }
         Ok(())
     }
 
     /// Writes the current time into the run row and writes no state. An
     /// exchange with no messages to run then does not look like a crashed one.
     pub fn heartbeat(&mut self) -> Result<(), StoreError> {
-        self.conn.execute(
-            "UPDATE runs SET heartbeat_ms = ?2 WHERE run_id = ?1",
-            params![self.run_id, now_millis() as i64],
+        let changed = self.conn.execute(
+            "UPDATE runs SET heartbeat_ms = ?2 WHERE run_id = ?1 AND epoch = ?4 AND status = 'open'",
+            params![self.run_id, now_millis() as i64, rusqlite::types::Null, self.epoch],
         )?;
+        if changed != 1 { return Err(StoreError::Fenced); }
         Ok(())
     }
 
@@ -633,10 +687,25 @@ impl Store {
     ) -> Result<(), StoreError> {
         let run_id = self.run_id;
         let recent_cap = crate::matcher::RECENT_MESSAGES_CAP as i64;
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let owned: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runs WHERE run_id=?1 AND epoch=?2 AND status='open')",
+            params![run_id, self.epoch], |row| row.get(0),
+        )?;
+        if !owned { return Err(StoreError::Fenced); }
+        let cursor: i64 = tx.query_row("SELECT last_seen FROM resume_point WHERE run_id=?1",
+            params![run_id], |row| row.get(0))?;
+        if counters.last_seen > i64::MAX as u64 || counters.last_seen < cursor as u64 {
+            return Err(StoreError::Corrupt("commit cursor cannot regress or exceed SQLite integer range".into()));
+        }
 
         for change in changes {
             match change {
+                Change::ExecutionState(state) => {
+                    let blob = serde_json::to_vec(state).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+                    tx.execute("UPDATE resume_point SET root_version=?2, execution_state=?3 WHERE run_id=?1",
+                        params![run_id, state.root_version, blob])?;
+                }
                 Change::OrderRested(order) => {
                     tx.execute(
                         "INSERT OR REPLACE INTO open_orders
@@ -842,8 +911,8 @@ impl Store {
         let now = now_millis() as i64;
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO runs (started_at, heartbeat_ms, status, feed_url, owner_pid)
-             VALUES (?1, ?1, ?2, ?3, ?4)",
+            "INSERT INTO runs (started_at, heartbeat_ms, status, feed_url, owner_pid, epoch)
+             VALUES (?1, ?1, ?2, ?3, ?4, 1)",
             params![now, status::OPEN, feed_url, std::process::id() as i64],
         )?;
         let run_id = tx.last_insert_rowid();
@@ -856,25 +925,27 @@ impl Store {
              VALUES (?1, 0, 0, 0, 0, 0, ?2)",
             params![run_id, crate::logchain::EMPTY_CHAIN.as_slice()],
         )?;
+        tx.execute("UPDATE resume_point SET root_version=5 WHERE run_id=?1", params![run_id])?;
         tx.commit()?;
         self.run_id = run_id;
+        self.epoch = 1;
         Ok(())
     }
 
     /// Finds the resumable run and takes it over. Returns `None` when there is
     /// nothing to resume.
     fn claim_open_run(&mut self, grace_ms: u64, reset: bool) -> Result<Option<i64>, StoreError> {
-        let resumable: Option<(i64, String, i64, i64)> = self
+        let resumable: Option<(i64, String, i64, i64, i64)> = self
             .conn
             .query_row(
-                "SELECT run_id, status, heartbeat_ms, owner_pid FROM runs
+                "SELECT run_id, status, heartbeat_ms, owner_pid, epoch FROM runs
                  WHERE status IN (?1, ?2) ORDER BY run_id DESC LIMIT 1",
                 params![status::OPEN, status::STOPPED],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .optional()?;
 
-        let Some((run_id, run_status, heartbeat_ms, owner_pid)) = resumable else {
+        let Some((run_id, run_status, heartbeat_ms, owner_pid, epoch)) = resumable else {
             return Ok(None);
         };
 
@@ -895,7 +966,7 @@ impl Store {
             )));
         }
 
-        if !self.take_run(run_id, heartbeat_ms, owner_pid)? {
+        if !self.take_run(run_id, heartbeat_ms, owner_pid, epoch)? {
             return Err(StoreError::Busy(format!(
                 "run {} in {} was claimed by another matcher a moment ago; \
                  another matcher is already using this database",
@@ -904,6 +975,7 @@ impl Store {
             )));
         }
 
+        self.epoch = epoch.checked_add(1).ok_or_else(|| StoreError::Corrupt("epoch exhausted".into()))?;
         if reset {
             // This claims the run first and abandons it second. Without the
             // claim, two processes that reset the same run at the same moment
@@ -934,11 +1006,12 @@ impl Store {
         run_id: i64,
         seen_heartbeat: i64,
         seen_owner: i64,
+        seen_epoch: i64,
     ) -> Result<bool, StoreError> {
         let claimed = self.conn.execute(
-            "UPDATE runs SET status = ?2, closed_at = NULL, heartbeat_ms = ?3, owner_pid = ?4
+            "UPDATE runs SET status = ?2, closed_at = NULL, heartbeat_ms = ?3, owner_pid = ?4, epoch = epoch + 1
              WHERE run_id = ?1 AND status IN (?2, ?5)
-               AND heartbeat_ms = ?6 AND owner_pid = ?7",
+               AND heartbeat_ms = ?6 AND owner_pid = ?7 AND epoch = ?8 AND epoch < 9223372036854775807",
             params![
                 run_id,
                 status::OPEN,
@@ -947,6 +1020,7 @@ impl Store {
                 status::STOPPED,
                 seen_heartbeat,
                 seen_owner,
+                seen_epoch,
             ],
         )?;
         Ok(claimed == 1)
@@ -1242,7 +1316,25 @@ impl Store {
             )));
         }
 
+        let (root_version, blob): (u32, Option<Vec<u8>>) = self.conn.query_row(
+            "SELECT root_version, execution_state FROM resume_point WHERE run_id=?1",
+            params![run_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        if root_version != 5 && counters.last_seen > 0 {
+            return Err(StoreError::Corrupt(format!("legacy root v{} omitted MidWindow; equivalent recovery is unavailable. Replay into a new run or explicitly reset; historical rows and roots are preserved", root_version)));
+        }
+        let execution_state = match blob {
+            Some(blob) => serde_json::from_slice::<ExecutionState>(&blob)
+                .map_err(|e| StoreError::Corrupt(format!("invalid execution state: {}", e)))?,
+            None if counters.last_seen == 0 => ExecutionState::default(),
+            None => return Err(StoreError::Corrupt("missing execution state".into())),
+        };
+        if execution_state.root_version != 5 { return Err(StoreError::Corrupt("unsupported execution root version".into())); }
+        let last_claim = self.conn.query_row(
+            "SELECT from_msg,to_msg,root_before,root_after,trades_total,signature FROM claims WHERE run_id=?1 ORDER BY to_msg DESC LIMIT 1",
+            params![run_id], claim_row_from_sql).optional()?;
+        let matcher_pubkey = self.matcher_pubkey()?;
         let snapshot = Snapshot {
+            execution_state, last_claim, matcher_pubkey,
             counters,
             orders,
             listings,
@@ -1585,6 +1677,21 @@ impl HistoryReader {
     }
 }
 
+fn claim_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimRow> {
+    fn blob<const N: usize>(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<[u8; N]> {
+        let bytes: Vec<u8> = row.get(index)?;
+        bytes.try_into().map_err(|_| rusqlite::Error::InvalidColumnType(index, "claim blob".into(), rusqlite::types::Type::Blob))
+    }
+    let from: i64 = row.get(0)?;
+    let to: i64 = row.get(1)?;
+    let trades: i64 = row.get(4)?;
+    if from <= 0 || to < from || trades < 0 { return Err(rusqlite::Error::InvalidQuery); }
+    let signature: Option<Vec<u8>> = row.get(5)?;
+    let signature = signature.map(|bytes| bytes.try_into().map_err(|_| rusqlite::Error::InvalidQuery)).transpose()?;
+    Ok(ClaimRow { from_msg: from as u64, to_msg: to as u64, root_before: blob(row, 2)?,
+        root_after: blob(row, 3)?, trades_total: trades as u64, signature })
+}
+
 /// Reads a stored blob as a value of exactly `N` bytes. `what` names the value
 /// in the error message, so a wrong byte count says which value was wrong.
 fn fixed<const N: usize>(bytes: Vec<u8>, what: &str) -> Result<[u8; N], StoreError> {
@@ -1920,6 +2027,14 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
                 Ok(())
             })?;
         }
+        if version < 13 {
+            migration_step(conn, 13, |tx| {
+                tx.execute_batch("ALTER TABLE runs ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0;
+                    ALTER TABLE resume_point ADD COLUMN root_version INTEGER NOT NULL DEFAULT 4;
+                    ALTER TABLE resume_point ADD COLUMN execution_state BLOB;")?;
+                Ok(())
+            })?;
+        }
         return Ok(());
     }
     if version != 0 {
@@ -1987,7 +2102,8 @@ const CREATE_SCHEMA: &str = "
            owner_pid    INTEGER NOT NULL,
            feed_session TEXT,
            feed_pubkey  TEXT,
-           matcher_pubkey TEXT
+           matcher_pubkey TEXT,
+           epoch INTEGER NOT NULL DEFAULT 0
          );
 
          -- The resume point, written in the same transaction as the state it
@@ -2002,7 +2118,9 @@ const CREATE_SCHEMA: &str = "
            orders_ignored     INTEGER NOT NULL,
            chain_hash         BLOB,
            rule_version       INTEGER,
-           operator_key       BLOB
+           operator_key       BLOB,
+           root_version INTEGER NOT NULL DEFAULT 4,
+           execution_state BLOB
          );
 
          CREATE TABLE open_orders (
@@ -2422,7 +2540,7 @@ mod tests {
             let conn = Connection::open(&path).expect("opens");
             conn.execute_batch(V9_SCHEMA).expect("the v9 schema");
             conn.execute_batch(
-                "INSERT INTO runs (started_at, heartbeat_ms, status, feed_url, owner_pid)
+                "INSERT INTO runs (started_at, heartbeat_ms, status, feed_url, owner_pid, epoch)
                    VALUES (0, 0, 'stopped', 'http://feed', 0);
                  INSERT INTO resume_point (run_id, last_seen, messages_processed,
                                            cancels_applied, cancels_ignored, orders_ignored,

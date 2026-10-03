@@ -886,27 +886,24 @@ impl FeedState {
         let mut conn = open_feed_db(path)?;
         // Refuse before materializing these required historical indexes. Never
         // start with a partial index or delete records to make a history fit.
-        for (sql, max, name) in [
-            (
-                "SELECT COUNT(*) FROM feed_accounts",
-                limits.max_accounts,
-                "account",
-            ),
-            (
-                "SELECT COUNT(*) FROM inbox_sequenced",
-                limits.max_inbox_records,
-                "inbox record",
-            ),
-        ] {
-            let count: u64 = conn
-                .query_row(sql, [], |row| row.get(0))
-                .map_err(|e| e.to_string())?;
+        let check_capacity = |count: u64, max: u64, name: &str| {
             if count > max {
                 return Err(format!(
                     "stored {name} count {count} exceeds capacity {max}; history is retained"
                 ));
             }
-        }
+            Ok(())
+        };
+        // Keep SQL separate from labels and policy values: these are literal,
+        // read-only count queries with no bound account or secret data.
+        let account_count = conn
+            .query_row("SELECT COUNT(*) FROM feed_accounts", [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        check_capacity(account_count, limits.max_accounts, "account")?;
+        let inbox_count = conn
+            .query_row("SELECT COUNT(*) FROM inbox_sequenced", [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        check_capacity(inbox_count, limits.max_inbox_records, "inbox record")?;
 
         // How much of the tree this database already holds, before one message
         // is read. These two values decide whether this start has to build any

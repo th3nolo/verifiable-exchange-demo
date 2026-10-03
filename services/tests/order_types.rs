@@ -275,8 +275,7 @@ fn engine_with(book: Book) -> (MatcherState, u64) {
     (engine, next)
 }
 
-/// The state root the same engine would have if the message it is about to be
-/// given had done nothing at all.
+/// The same engine after consuming a message that changes no execution effects.
 ///
 /// `state_root` covers the cursor as well as the books and the positions, so an
 /// engine that refused a message does not hash to what it hashed before the
@@ -284,11 +283,32 @@ fn engine_with(book: Book) -> (MatcherState, u64) {
 /// a message of the same id that really changed nothing, and a cancel naming an
 /// order that does not exist is exactly that: `apply_cancel` counts it and
 /// returns without touching a book.
-fn root_if_nothing_had_happened(mut engine: MatcherState, id: u64) -> [u8; 32] {
+fn engine_if_nothing_had_happened(mut engine: MatcherState, id: u64) -> MatcherState {
     engine
         .apply_message(&cancel(id, 20_000, 4_242, 4_242))
         .expect("in feed order");
-    engine.state_root()
+    engine
+}
+
+/// Different consumed messages authenticate different history in v5. Compare
+/// all execution effects separately: v4 covers the book, positions, registry
+/// and rule/operator state; the typed v5 payload adds ledger and reference state.
+fn assert_same_execution(actual: &MatcherState, expected: &MatcherState) {
+    assert_eq!(
+        actual.state_root_for_version(4),
+        expected.state_root_for_version(4)
+    );
+    assert_eq!(
+        serde_json::to_value(actual.execution_state()).unwrap(),
+        serde_json::to_value(expected.execution_state()).unwrap(),
+        "a refused command changed ledger, reference window or resource policy"
+    );
+    assert_eq!(actual.trades_total(), expected.trades_total());
+    assert_ne!(
+        actual.state_root(),
+        expected.state_root(),
+        "v5 must authenticate the different consumed messages"
+    );
 }
 
 /// Every combination of the three terms against every state of the book:
@@ -626,12 +646,12 @@ fn all_thirty_six_combinations_of_terms_and_book() {
 }
 
 /// A fill-or-kill order that cannot fill entirely leaves the book exactly as it
-/// found it: no partial fills, no empty book, and the same state root.
+/// found it: no partial fills, no empty book, and unchanged execution effects.
 #[test]
 fn a_fill_or_kill_that_cannot_fill_changes_nothing_at_all() {
     for book in [Book::Empty, Book::Partial] {
         let (mut engine, id) = engine_with(book);
-        let untouched = root_if_nothing_had_happened(engine_with(book).0, id);
+        let untouched = engine_if_nothing_had_happened(engine_with(book).0, id);
         let trades_before = engine.trades_total();
         let bid_before = engine.best_bid_cents(SYMBOL);
         let ask_before = engine.best_ask_cents(SYMBOL);
@@ -651,12 +671,7 @@ fn a_fill_or_kill_that_cannot_fill_changes_nothing_at_all() {
             ),
         );
         assert!(outcome.refused, "{:?}: it cannot fill whole", book);
-        assert_eq!(
-            engine.state_root(),
-            untouched,
-            "{:?}: a refused fill-or-kill order moved the state root",
-            book
-        );
+        assert_same_execution(&engine, &untouched);
         assert_eq!(engine.trades_total(), trades_before, "{:?}", book);
         assert_eq!(engine.best_bid_cents(SYMBOL), bid_before, "{:?}", book);
         assert_eq!(engine.best_ask_cents(SYMBOL), ask_before, "{:?}", book);
@@ -685,7 +700,6 @@ fn a_refusal_leaves_no_empty_book_behind() {
     untouched
         .apply_message(&cancel(2, 1_000, 9, 4_242))
         .expect("in feed order");
-    let nothing_happened = untouched.state_root();
 
     // Step 2 refuses before a book entry exists at all.
     for (order_type, time_in_force, post_only) in [
@@ -721,14 +735,7 @@ fn a_refusal_leaves_no_empty_book_behind() {
             "{:?}/{:?}/post_only {} was expected to be refused",
             order_type, time_in_force, post_only
         );
-        assert_eq!(
-            engine.state_root(),
-            nothing_happened,
-            "{:?}/{:?}/post_only {} left something behind",
-            order_type,
-            time_in_force,
-            post_only
-        );
+        assert_same_execution(&engine, &untouched);
     }
 }
 
@@ -789,7 +796,7 @@ fn post_only_is_refused_when_it_would_take_and_rests_when_it_would_not() {
     // At the ask's own price it would trade, so it is refused and the book is
     // untouched.
     let (mut engine, id) = engine_with(Book::Full);
-    let untouched = root_if_nothing_had_happened(engine_with(Book::Full).0, id);
+    let untouched = engine_if_nothing_had_happened(engine_with(Book::Full).0, id);
     let refused = apply(
         &mut engine,
         &order(
@@ -805,7 +812,7 @@ fn post_only_is_refused_when_it_would_take_and_rests_when_it_would_not() {
         ),
     );
     assert_eq!(refused, Outcome::refused());
-    assert_eq!(engine.state_root(), untouched);
+    assert_same_execution(&engine, &untouched);
     assert_eq!(engine.best_ask_cents(SYMBOL), Some(1005));
 }
 
@@ -1075,7 +1082,7 @@ fn a_market_order_with_no_reference_price_is_refused_not_filled() {
 
 /// A history of plain limit orders reaches the state it always did.
 ///
-/// The root below is this build's, and it had to be: the state root now covers
+/// The historical v4 root below remains explicit: the state root covers
 /// the symbol registry, and it says `exchange-state-v4`. Two engines with the
 /// same books over different registries trade differently and must not share a
 /// root. The root moved again when the tag reached v4, for two
@@ -1119,13 +1126,18 @@ fn a_history_with_no_new_order_types_hashes_to_the_root_it_always_did() {
         engine.apply_message(message).expect("in feed order");
     }
     let root: String = engine
-        .state_root()
+        .state_root_for_version(4)
         .iter()
         .map(|byte| format!("{:02x}", byte))
         .collect();
     assert_eq!(
         root, "058e26bcc1c7c6f21ea7dcbaf1d26e01a32caf38709619307fcb43a869977c4f",
         "a history of plain limit orders no longer produces the state it used to"
+    );
+    assert_eq!(
+        logchain::to_hex(&engine.state_root()),
+        "f335e87042d6a93e70dced02e09e6107a891373d7e162427ad72167c653d66bf",
+        "the v5 execution and consumed-history encoding changed"
     );
     assert_eq!(engine.trades_total(), 3);
     assert_eq!(engine.orders_ignored(), 0);

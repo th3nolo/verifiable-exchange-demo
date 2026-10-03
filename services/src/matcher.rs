@@ -3793,18 +3793,22 @@ impl Poller {
         apply_batch(&mut candidate, messages, head)?;
         if let Some(store) = self.store.take() {
             let pending = candidate.take_pending().expect("durable state records changes");
+            #[cfg(not(feature = "dishonest"))]
+            let root = pending.root;
+            #[cfg(feature = "dishonest")]
+            let root = crate::dishonest::doctor_root(pending.root);
             let signature = logchain::sign_claim(&self.claim_key, &pending.session,
                 self.committed.last_seen + 1, pending.counters.last_seen, &self.committed_root,
-                &pending.root, pending.trades_total);
+                &root, pending.trades_total);
             let claim = ClaimRow { from_msg: self.committed.last_seen + 1, to_msg: pending.counters.last_seen,
-                root_before: self.committed_root, root_after: pending.root, trades_total: pending.trades_total,
+                root_before: self.committed_root, root_after: root, trades_total: pending.trades_total,
                 signature: Some(signature.to_bytes()) };
             let (store, _, result) = commit_off_thread(store, pending.changes, pending.counters.clone(), Some(claim)).await;
             self.store = Some(store);
             if let Err(e) = result { self.pause(e); return Ok(()); }
             candidate.durable_last_seen = pending.counters.last_seen;
             self.committed = pending.counters;
-            self.committed_root = pending.root;
+            self.committed_root = root;
             self.last_heartbeat = Instant::now();
         }
         let tick = self.live.wanted().then(|| tick_of(&candidate, trades_before, messages, STREAM_DEPTH));
@@ -4117,7 +4121,7 @@ impl Poller {
                 store.run_id(),
                 self.committed.last_seen
             ),
-            Err(e) => error!("could not close the run cleanly: {}", e),
+            Err(e) => self.pause(e),
         }
     }
 }

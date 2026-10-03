@@ -8,7 +8,7 @@
 //!
 //! ENGINE.md 4.2.1 and 4.2.2 are the text those numbers come from.
 //!
-//! # Why two checks and not one
+//! # Independent order-term checks
 //!
 //! `refused` reports an order the rules allowed no fill at all. There are
 //! three: a post-only order that would trade at once, a fill-or-kill order the
@@ -16,6 +16,8 @@
 //! `collared` reports a market order that filled outside the bound the
 //! exchange applies for itself. The first check says the fill should not
 //! exist. The second says the fill exists at the wrong price.
+//! `all_or_none` checks the sum of every FOK fill, even with ample initial
+//! liquidity. A missing later fill must not pass merely because each row fits.
 
 use std::collections::HashMap;
 
@@ -205,7 +207,7 @@ impl ReplayBook {
                 Side::Sell => **price >= limit_cents,
             })
             .flat_map(|(_, level)| level.values())
-            .sum()
+            .fold(0i64, |total, qty| total.saturating_add(*qty))
     }
 
     /// The mid price this book shows. It is halfway between the best bid and
@@ -226,6 +228,8 @@ pub(super) struct Checks {
     pub(super) refused: Check,
     /// The collar a market order had to fill inside.
     pub(super) collared: Check,
+    /// Independently require all-or-none, even when initial liquidity suffices.
+    pub(super) all_or_none: Check,
 }
 
 impl Checks {
@@ -233,6 +237,7 @@ impl Checks {
         Checks {
             refused: Check::new("no fill for an order the rules refuse"),
             collared: Check::new("every market order filled inside its collar"),
+            all_or_none: Check::new("every fill-or-kill order filled completely or not at all"),
         }
     }
 }
@@ -244,7 +249,7 @@ impl Checks {
 /// whether the order rests, and the price a market order's fills are held to.
 ///
 /// `fills` is the rows the trade record gives this one arriving order. Only
-/// how many there are is read here.
+/// refusal and the sum of their integer quantities are checked independently.
 pub(super) fn observe(
     checks: &mut Checks,
     id: OrderId,
@@ -253,6 +258,21 @@ pub(super) fn observe(
     reference_cents: Option<i64>,
     fills: &[LoggedTrade],
 ) -> OrderFate {
+    if matches!(taker.time_in_force, TimeInForce::FillOrKill) {
+        checks.all_or_none.checked += 1;
+        // i128 handles even an adversarial log's aggregate quantity. Positive
+        // row quantities and per-order overfills have their own row checks.
+        let filled: i128 = fills.iter().map(|fill| fill.qty_tenths as i128).sum();
+        if !fills.is_empty() && filled != taker.qty_tenths as i128 {
+            checks.all_or_none.fail(format!(
+                "fill-or-kill order {} requested {} tenths, but its {} fill(s) total {} tenths",
+                id,
+                taker.qty_tenths,
+                fills.len(),
+                filled,
+            ));
+        }
+    }
     let answer = fate(taker, book, reference_cents);
     if let OrderFate::Refused(why) = &answer {
         checks.refused.checked += 1;
@@ -280,6 +300,70 @@ mod tests {
 
     const REFUSED: &str = "no fill for an order the rules refuse";
     const COLLAR: &str = "every market order filled inside its collar";
+
+    const ALL_OR_NONE: &str = "every fill-or-kill order filled completely or not at all";
+
+    #[tokio::test]
+    async fn fok_missing_later_fill_is_reported_with_sufficient_initial_liquidity() {
+        let messages = vec![
+            list_eth(1),
+            plain_at(2, 1_000, 5, Side::Sell, 100.0, 2.0),
+            plain_at(3, 2_000, 6, Side::Sell, 100.0, 3.0),
+            termed(
+                4,
+                3_000,
+                7,
+                Side::Buy,
+                100.0,
+                5.0,
+                OrderType::Limit,
+                TimeInForce::FillOrKill,
+                false,
+            ),
+        ];
+        let full = vec![
+            traded(1, 2, 5, 4, 7, Side::Buy, 10_000, 20),
+            traded(2, 3, 6, 4, 7, Side::Buy, 10_000, 30),
+        ];
+        for check in replay(&messages, &full).await.checks() {
+            assert!(
+                check.failures.is_empty(),
+                "{}: {:?}",
+                check.name,
+                check.failures
+            );
+        }
+        let partial = replay_check(&messages, &full[..1], ALL_OR_NONE).await;
+        assert_eq!(partial.checked, 1);
+        assert_eq!(partial.failures.len(), 1);
+        assert!(partial.failures[0].contains("total 20 tenths"));
+    }
+
+    #[tokio::test]
+    async fn fok_zero_fills_is_allowed_and_overfill_is_reported() {
+        let messages = vec![
+            list_eth(1),
+            plain_at(2, 1_000, 5, Side::Sell, 100.0, 6.0),
+            termed(
+                3,
+                2_000,
+                7,
+                Side::Buy,
+                100.0,
+                5.0,
+                OrderType::Limit,
+                TimeInForce::FillOrKill,
+                false,
+            ),
+        ];
+        let zero = replay_check(&messages, &[], ALL_OR_NONE).await;
+        assert_eq!(zero.checked, 1);
+        assert!(zero.failures.is_empty());
+        let overfill = vec![traded(1, 2, 5, 3, 7, Side::Buy, 10_000, 60)];
+        let check = replay_check(&messages, &overfill, ALL_OR_NONE).await;
+        assert_eq!(check.failures.len(), 1);
+        assert!(check.failures[0].contains("total 60 tenths"));
+    }
 
     fn plain_at(
         id: OrderId,
@@ -429,8 +513,7 @@ mod tests {
         );
     }
 
-    /// A fill-or-kill order the book can fill whole is an ordinary order, and
-    /// nothing here says anything about it.
+    /// A complete fill-or-kill log passes both liquidity and all-or-none checks.
     #[tokio::test]
     async fn a_fill_or_kill_order_the_book_could_fill_whole_passes() {
         let messages = vec![

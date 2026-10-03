@@ -11,15 +11,21 @@ Start the funded simulation with the sequencer already running:
 ```sh
 cd services
 cargo run -- --start-matcher --ledger-mode funded-simulation \
-  --funding funding.example.json --no-state-db
+  --funding funding.example.json --state-db state.db
 ```
 
-`--no-state-db` replays the sequencer's retained history from genesis after a
-process restart. The ledger snapshot/persistence integration is owned by the
-versioned execution-state implementation; this isolated ledger change refuses
-funded SQLite startup until that integration is connected. Use the exact same
-funding JSON when replaying the same history. Reading `/balances`, rejecting an
-order or cancelling it never grants funds.
+SQLite commits the complete ledger and execution policy with the book, cursor,
+reference-price window and signed claim. Recovery validates reserves against
+open orders and checks the restored root against the authenticated claim before
+serving the state. Restart requires the same explicit mode and funding JSON;
+it restores balances and reservations without issuing funding again. Root v5
+commits to this state; consumed historical v4 runs cannot resume equivalently
+because they omitted the reference window, though their claims remain auditable.
+
+`--no-state-db` explicitly selects volatile execution and replays retained history
+from genesis after restart. Reading `/balances`, rejecting an order or cancelling
+it never grants funds. `/claims` supplies the original funding and resource policy
+as `execution_genesis` so local and remote audits replay the same semantics.
 
 For the original generated traffic and PnL demonstration:
 

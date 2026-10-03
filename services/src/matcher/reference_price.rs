@@ -259,24 +259,51 @@ impl SymbolWindow {
 }
 
 impl MidWindow {
-    pub(super) fn snapshot(&self) -> std::collections::BTreeMap<String, crate::store::MidWindowRow> {
-        self.per_symbol.iter().map(|(symbol, window)| (symbol.clone(), crate::store::MidWindowRow {
-            clip_ms: window.clip_ms, samples: window.samples.iter().copied().collect(),
-        })).collect()
+    pub(super) fn snapshot(
+        &self,
+    ) -> std::collections::BTreeMap<String, crate::store::MidWindowRow> {
+        self.per_symbol
+            .iter()
+            .map(|(symbol, window)| {
+                (
+                    symbol.clone(),
+                    crate::store::MidWindowRow {
+                        clip_ms: window.clip_ms,
+                        samples: window.samples.iter().copied().collect(),
+                    },
+                )
+            })
+            .collect()
     }
-    pub(super) fn restore(rows: std::collections::BTreeMap<String, crate::store::MidWindowRow>) -> Result<Self, crate::store::StoreError> {
+    pub(super) fn restore(
+        rows: std::collections::BTreeMap<String, crate::store::MidWindowRow>,
+    ) -> Result<Self, crate::store::StoreError> {
         let mut result = Self::default();
         for (symbol, row) in rows {
-            if row.samples.is_empty() || row.samples.len() > WINDOW_MS as usize + 1
+            if row.samples.is_empty()
+                || row.samples.len() > WINDOW_MS as usize + 1
                 || row.samples.windows(2).any(|pair| pair[0].0 >= pair[1].0)
-                || row.samples.iter().any(|(_, mid)| mid.is_some_and(|mid| mid <= 0)) {
-                return Err(crate::store::StoreError::Corrupt("invalid MidWindow samples".into()));
+                || row
+                    .samples
+                    .iter()
+                    .any(|(_, mid)| mid.is_some_and(|mid| mid <= 0))
+            {
+                return Err(crate::store::StoreError::Corrupt(
+                    "invalid MidWindow samples".into(),
+                ));
             }
-            let mut window = SymbolWindow { samples: row.samples.into(), clip_ms: row.clip_ms, ..Default::default() };
+            let mut window = SymbolWindow {
+                samples: row.samples.into(),
+                clip_ms: row.clip_ms,
+                ..Default::default()
+            };
             for index in 0..window.samples.len().saturating_sub(1) {
                 let (from, mid) = window.samples[index];
                 if let Some(mid) = mid {
-                    let held = window.samples[index + 1].0.saturating_sub(from.max(window.clip_ms)) as i128;
+                    let held = window.samples[index + 1]
+                        .0
+                        .saturating_sub(from.max(window.clip_ms))
+                        as i128;
                     window.closed_weight += held;
                     window.closed_weighted += mid as i128 * held;
                 }

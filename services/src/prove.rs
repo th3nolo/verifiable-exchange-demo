@@ -126,6 +126,7 @@ struct RunSummary {
 #[derive(Debug)]
 struct RunFacts {
     root_version: u32,
+    execution_genesis: Option<crate::matcher::ExecutionGenesis>,
     run_id: i64,
     /// The sequencer session this run counted its messages against, if the run
     /// recorded one. A session is a name for one log. `None` does not mean "no
@@ -340,13 +341,41 @@ fn read_db(path: &Path, wanted_run: Option<i64>) -> Result<RunRecord, String> {
     let claims = read_claims(&tx, run_id)?;
     let trades = read_trades(&tx, run_id)?;
 
-    let schema: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0)).map_err(|e| e.to_string())?;
+    let schema: i64 = tx
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
     let root_version = if schema >= 13 {
-        tx.query_row("SELECT root_version FROM resume_point WHERE run_id=?1", params![run_id], |row| row.get(0)).map_err(|e| e.to_string())?
-    } else { 4 };
+        tx.query_row(
+            "SELECT root_version FROM resume_point WHERE run_id=?1",
+            params![run_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?
+    } else {
+        4
+    };
+    let execution_genesis = if schema >= 13 && root_version == 5 {
+        let bytes: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT execution_state FROM resume_point WHERE run_id=?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        bytes
+            .map(|bytes| {
+                let execution: crate::store::ExecutionState = serde_json::from_slice(&bytes)
+                    .map_err(|e| format!("invalid execution snapshot: {e}"))?;
+                crate::matcher::ExecutionGenesis::from_execution_state(&execution)
+            })
+            .transpose()?
+    } else {
+        None
+    };
     Ok(RunRecord {
         facts: RunFacts {
             root_version,
+            execution_genesis,
             run_id,
             session,
             feed_pubkey,
@@ -746,6 +775,8 @@ impl Messages<'_> {
 struct ClaimsPage {
     #[serde(default = "legacy_root_version")]
     root_version: u32,
+    #[serde(default)]
+    execution_genesis: Option<crate::matcher::ExecutionGenesis>,
     run_id: i64,
     session: String,
     cursor: OrderId,
@@ -754,7 +785,9 @@ struct ClaimsPage {
     claims: Vec<WireClaim>,
 }
 
-fn legacy_root_version() -> u32 { 4 }
+fn legacy_root_version() -> u32 {
+    4
+}
 
 #[cfg(test)]
 mod root_version_regressions {
@@ -1169,11 +1202,22 @@ impl Replay {
     #[cfg(test)]
     fn regression_claim_version(version: u32) {
         let session = "root-version-regression";
-        let msg = OrderMessage::New { id: 1, timestamp: 0, account: 1, symbol: "UNLISTED".into(),
-            side: crate::domain::Side::Buy, price: 99.0, quantity: 1.0, nonce: None,
-            order_type: Default::default(), time_in_force: Default::default(), post_only: false };
+        let msg = OrderMessage::New {
+            id: 1,
+            timestamp: 0,
+            account: 1,
+            symbol: "UNLISTED".into(),
+            side: crate::domain::Side::Buy,
+            price: 99.0,
+            quantity: 1.0,
+            nonce: None,
+            order_type: Default::default(),
+            time_in_force: Default::default(),
+            post_only: false,
+        };
         let bytes = logchain::canonical_bytes(&msg);
-        let mut body = bytes; body.push(b'\n');
+        let mut body = bytes;
+        body.push(b'\n');
         let raw = crate::wire::split_ndjson(&body).unwrap().pop().unwrap();
         let mut engine = MatcherState::replaying(session);
         let before = engine.state_root_for_version(version);
@@ -1181,10 +1225,20 @@ impl Replay {
         let after = engine.state_root_for_version(version);
         let mut replay = Self::new(None, Vec::new(), session);
         replay.root_version = version;
-        replay.push_claims(vec![ClaimRow { from_msg: 1, to_msg: 1, root_before: before,
-            root_after: after, trades_total: 0, signature: None }]);
+        replay.push_claims(vec![ClaimRow {
+            from_msg: 1,
+            to_msg: 1,
+            root_before: before,
+            root_after: after,
+            trades_total: 0,
+            signature: None,
+        }]);
         replay.apply(&raw);
-        assert_eq!(replay.roots.failed, 0, "root v{version}: {:?}", replay.roots.failures);
+        assert_eq!(
+            replay.roots.failed, 0,
+            "root v{version}: {:?}",
+            replay.roots.failures
+        );
         assert_eq!(replay.totals.failed, 0);
         assert_eq!(replay.boundaries_checked, 2);
     }
@@ -1369,7 +1423,10 @@ impl Replay {
         }
         self.messages_replayed += 1;
         if self.anchors_at.binary_search(&msg.id()).is_ok() {
-            self.at_anchors.insert(msg.id(), self.engine.state_root_for_version(self.root_version));
+            self.at_anchors.insert(
+                msg.id(),
+                self.engine.state_root_for_version(self.root_version),
+            );
         }
 
         while self.ahead.front().is_some_and(|c| c.to_msg == msg.id()) {
@@ -2025,12 +2082,26 @@ async fn check_run(
     let mut signatures = Check::new("every claim is signed by this run's key");
 
     let started = Instant::now();
-    if !matches!(facts.root_version, 4 | 5) { return Err(format!("unsupported execution root version {}", facts.root_version)); }
+    if !matches!(facts.root_version, 4 | 5) {
+        return Err(format!(
+            "unsupported execution root version {}",
+            facts.root_version
+        ));
+    }
     let mut replay = Replay::new(horizon, anchors_at.clone(), &claim_session);
     replay.root_version = facts.root_version;
+    if facts.root_version == 5 {
+        match &facts.execution_genesis {
+            Some(genesis) => replay.engine = genesis.replaying(&claim_session)?,
+            None if facts.cursor == 0 => {}
+            None => return Err("root v5 run is missing its execution genesis policy".into()),
+        }
+    }
     replay.engine.set_replay_feed_key(facts.feed_pubkey.clone());
     if anchors_at.first() == Some(&0) {
-        replay.at_anchors.insert(0, replay.engine.state_root_for_version(facts.root_version));
+        replay
+            .at_anchors
+            .insert(0, replay.engine.state_root_for_version(facts.root_version));
     }
     let mut fold = ChainFold::new(
         head.as_ref().ok().map(|h| h.last_id),
@@ -2599,6 +2670,7 @@ pub async fn audit_url(
 
     let facts = RunFacts {
         root_version: envelope.root_version,
+        execution_genesis: envelope.execution_genesis.clone(),
         run_id: envelope.run_id,
         session: (!envelope.session.is_empty()).then(|| envelope.session.clone()),
         feed_pubkey: envelope.feed_public_key.clone(),
@@ -2826,6 +2898,22 @@ mod tests {
         feed_key: &SigningKey,
         claim_key: &SigningKey,
     ) -> PathBuf {
+        build_db_with_engine(
+            dir,
+            messages,
+            feed_key,
+            claim_key,
+            MatcherState::replaying(SESSION),
+        )
+    }
+
+    fn build_db_with_engine(
+        dir: &TempDir,
+        messages: &[OrderMessage],
+        feed_key: &SigningKey,
+        claim_key: &SigningKey,
+        mut engine: MatcherState,
+    ) -> PathBuf {
         let path = dir.path().join("state.db");
         let (mut store, _) = Store::open(&path, "http://feed", 200, false).expect("open store");
         store.set_feed_session(SESSION).expect("session");
@@ -2838,7 +2926,6 @@ mod tests {
 
         // The matching engine the exchange ran. It knows which log it is on,
         // so it can check who signed the listing that starts the history.
-        let mut engine = MatcherState::replaying(SESSION);
         engine.set_replay_feed_key(Some(logchain::to_hex(feed_key.verifying_key().as_bytes())));
         let mut root_before = engine.state_root();
         let mut chain = logchain::EMPTY_CHAIN;
@@ -2846,7 +2933,7 @@ mod tests {
         for msg in messages {
             engine.apply_message(msg).expect("apply");
             chain = logchain::extend(&chain, msg);
-            let changes: Vec<Change> = engine
+            let mut changes: Vec<Change> = engine
                 .trades()
                 .filter(|t| t.trade_id > written)
                 .map(|t| {
@@ -2864,6 +2951,7 @@ mod tests {
                     })
                 })
                 .collect();
+            changes.push(Change::ExecutionState(engine.execution_state()));
             written = engine.trades_total();
             let root_after = engine.state_root();
             let signature = logchain::sign_claim(
@@ -2991,6 +3079,82 @@ mod tests {
         // Finding 5: every boundary, and not one boundary in fifty.
         assert_eq!(outcome.boundaries_checked, outcome.boundaries_total);
         assert_eq!(outcome.boundaries_total, 61);
+    }
+
+    #[tokio::test]
+    async fn integrated_funded_audit_replays_committed_genesis_and_resource_policy() {
+        use crate::ledger::{Funding, FundingConfig, MarketAssets};
+        use crate::matcher::ResourceLimits;
+        let dir = TempDir::new().unwrap();
+        let key = SigningKey::from_bytes(&[72; 32]);
+        let config = FundingConfig {
+            markets: vec![MarketAssets {
+                symbol: "ETH-USDC".into(),
+                base_asset: "ETH".into(),
+                quote_asset: "USDC".into(),
+            }],
+            funding: vec![
+                Funding {
+                    account: 1,
+                    asset: "ETH".into(),
+                    units: 20_000,
+                },
+                Funding {
+                    account: 2,
+                    asset: "USDC".into(),
+                    units: 2_000_000,
+                },
+            ],
+            fee_units: 0,
+        };
+        let limits = ResourceLimits {
+            max_active_orders: 8,
+            max_positions: 4,
+            max_symbols: 4,
+        };
+        let engine = MatcherState::replaying_funded_simulation(SESSION, config)
+            .unwrap()
+            .with_resource_limits(limits)
+            .unwrap();
+        let messages = history(7);
+        let path = build_db_with_engine(&dir, &messages, &key, &key, engine);
+        let mut record = read_db(&path, None).unwrap();
+        assert_eq!(record.trades.len(), 3);
+        let head = Ok(signed_head(&key, SESSION, &messages));
+        let outcome = check_held(&record, &head, Some(SESSION), &messages).await;
+        assert!(outcome.passed(), "{}", outcome.failure_text());
+        assert_eq!(outcome.boundaries_checked, outcome.boundaries_total);
+        let original = record.facts.execution_genesis.clone();
+        record
+            .facts
+            .execution_genesis
+            .as_mut()
+            .unwrap()
+            .funding
+            .as_mut()
+            .unwrap()
+            .funding[0]
+            .units += 1_000;
+        let outcome = check_held(&record, &head, Some(SESSION), &messages).await;
+        assert!(
+            !outcome.passed(),
+            "different genesis cannot verify the signed roots"
+        );
+        record.facts.execution_genesis = original;
+        record
+            .facts
+            .execution_genesis
+            .as_mut()
+            .unwrap()
+            .resource_limits
+            .as_mut()
+            .unwrap()
+            .max_positions = 1;
+        let outcome = check_held(&record, &head, Some(SESSION), &messages).await;
+        assert!(
+            !outcome.passed(),
+            "different admission policy cannot verify the signed roots"
+        );
     }
 
     /// The audit accepts a log whose operator messages were signed for a real
@@ -3868,6 +4032,7 @@ mod tests {
         let record = RunRecord {
             facts: RunFacts {
                 root_version: 5,
+                execution_genesis: Some(engine.execution_genesis()),
                 run_id: 1,
                 session: Some(SESSION.to_string()),
                 feed_pubkey: Some(logchain::to_hex(key.verifying_key().as_bytes())),
@@ -4053,6 +4218,7 @@ mod tests {
             .collect();
         let facts = RunFacts {
             root_version: record.facts.root_version,
+            execution_genesis: record.facts.execution_genesis.clone(),
             run_id: record.facts.run_id,
             session: record.facts.session.clone(),
             feed_pubkey: record.facts.feed_pubkey.clone(),
@@ -4186,7 +4352,13 @@ mod tests {
     /// state root the matching engine had after it applied them. This function
     /// computes both the long way. So a test that passes says the audit agrees
     /// with the definition, and not with itself.
-    fn anchor_over(messages: &[OrderMessage], at: OrderId, session: &str, index: u64, feed_key: &SigningKey) -> Anchor {
+    fn anchor_over(
+        messages: &[OrderMessage],
+        at: OrderId,
+        session: &str,
+        index: u64,
+        feed_key: &SigningKey,
+    ) -> Anchor {
         let mut chain = logchain::EMPTY_CHAIN;
         let mut engine = MatcherState::replaying(session);
         engine.set_replay_feed_key(Some(logchain::to_hex(feed_key.verifying_key().as_bytes())));
@@ -4222,7 +4394,12 @@ mod tests {
 
     /// The anchors that an anchor sender which writes every `every` messages
     /// would have left while the sequencer published this history.
-    fn anchors_every(messages: &[OrderMessage], every: OrderId, session: &str, feed_key: &SigningKey) -> Vec<Anchor> {
+    fn anchors_every(
+        messages: &[OrderMessage],
+        every: OrderId,
+        session: &str,
+        feed_key: &SigningKey,
+    ) -> Vec<Anchor> {
         (1..)
             .map(|n| n * every)
             .take_while(|at| *at <= messages.len() as OrderId)

@@ -31,8 +31,8 @@ use crate::ledger::{FundingConfig, Ledger, LedgerError, LedgerMode, LedgerSnapsh
 use crate::logchain::{self, AttestStatus, Chain, EMPTY_CHAIN, StateRoot};
 use crate::operator::{self, valid_symbol};
 use crate::store::{
-    Change, ClaimRow, Counters, ExecutionState, HistoryReader, ListingRow, OrderRow, Snapshot, Store, StoreError,
-    TradeRow, status,
+    Change, ClaimRow, Counters, ExecutionState, HistoryReader, ListingRow, OrderRow, Snapshot,
+    Store, StoreError, TradeRow, status,
 };
 use crate::wire::{self, RawMessage, ReadMessage, TooOld};
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
@@ -40,6 +40,9 @@ use sha2::{Digest, Sha256};
 
 #[cfg(test)]
 mod recovery_tests;
+
+#[cfg(test)]
+mod integration_tests;
 
 // The exchange runs one `New` message through six steps, in this fixed order.
 // Each step is its own module, and **a step never calls another step**:
@@ -617,10 +620,62 @@ impl std::fmt::Display for ApplyError {
 
 impl std::error::Error for ApplyError {}
 
-/// Everything the matching engine holds: one book for each symbol, an index of
-/// open orders so a cancel needs no scan, the trades, the totals for each
-/// symbol, the position of each account, a window of the messages it consumed
-/// most recently, and the counters that account for every message it saw.
+/// The execution policy needed to replay a run from message one. Balances and
+/// reservations are reconstructed from that run, never reused as new funding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionGenesis {
+    pub ledger_mode: LedgerMode,
+    pub funding: Option<FundingConfig>,
+    pub resource_limits: Option<ResourceLimits>,
+}
+
+impl ExecutionGenesis {
+    pub fn replaying(&self, session: &str) -> Result<MatcherState, String> {
+        let mut state = match (self.ledger_mode, &self.funding) {
+            (LedgerMode::SyntheticLegacy, None) => MatcherState::replaying(session),
+            (LedgerMode::FundedSimulation, Some(config)) => {
+                MatcherState::replaying_funded_simulation(session, config.clone())
+                    .map_err(|e| e.to_string())?
+            }
+            _ => return Err("execution mode and genesis funding disagree".into()),
+        };
+        if let Some(limits) = self.resource_limits {
+            state = state.with_resource_limits(limits)?;
+        }
+        Ok(state)
+    }
+
+    pub fn from_execution_state(execution: &ExecutionState) -> Result<Self, String> {
+        if execution.root_version != 5 {
+            return Err("unsupported execution root version".into());
+        }
+        for name in execution.extensions.keys() {
+            if name != "ledger-v1" && name != resource_limits::RESOURCE_LIMITS_EXTENSION {
+                return Err(format!("unsupported execution extension {name}"));
+            }
+        }
+        let bytes = execution
+            .extensions
+            .get("ledger-v1")
+            .ok_or("missing ledger-v1 execution snapshot")?;
+        let snapshot: LedgerSnapshot =
+            serde_json::from_slice(bytes).map_err(|e| format!("invalid ledger snapshot: {e}"))?;
+        let ledger = Ledger::from_snapshot(snapshot).map_err(|e| e.to_string())?;
+        let resource_limits = execution
+            .extensions
+            .get(resource_limits::RESOURCE_LIMITS_EXTENSION)
+            .map(|bytes| ResourceLimits::from_snapshot_bytes(bytes))
+            .transpose()?;
+        Ok(Self {
+            ledger_mode: ledger.mode(),
+            funding: ledger.config().cloned(),
+            resource_limits,
+        })
+    }
+}
+
+/// Books, order indexes, positions, execution policy, and consumed counters.
 #[derive(Clone)]
 pub struct MatcherState {
     execution_extensions: BTreeMap<String, Vec<u8>>,
@@ -933,12 +988,14 @@ impl MatcherState {
         Ok(())
     }
 
-    /// Selects a bounded policy at volatile genesis. A recording engine must
-    /// carry this policy in its versioned snapshot before enabling it.
+    /// Selects a bounded policy at genesis; recording engines commit it with
+    /// their versioned execution snapshot.
     pub fn with_resource_limits(mut self, limits: ResourceLimits) -> Result<Self, String> {
         limits.validate()?;
-        if self.last_seen != 0 || self.pending.is_some() {
-            return Err("resource limits require volatile genesis; durable configuration must be restored from its versioned snapshot".to_string());
+        if self.last_seen != 0 {
+            return Err(
+                "resource limits require genesis; recovery uses the committed policy".to_string(),
+            );
         }
         self.resource_limits = Some(limits);
         Ok(self)
@@ -1025,12 +1082,43 @@ impl MatcherState {
     /// one position, and their order decides how the locked-in profit splits.
     fn restore(snapshot: Snapshot, store: &Store) -> Self {
         let mut state = MatcherState::recording(store);
+        let policy = ExecutionGenesis::from_execution_state(&snapshot.execution_state);
+        // A never-consumed legacy run has no execution effects to lose. A
+        // consumed run must carry the full typed execution snapshot.
+        if let Err(e) = &policy {
+            if snapshot.counters.last_seen > 0 || !snapshot.execution_state.extensions.is_empty() {
+                error!("cannot restore execution policy: {}", e);
+                std::process::exit(2);
+            }
+        }
+        state
+            .restore_resource_limits(
+                snapshot
+                    .execution_state
+                    .extensions
+                    .get(resource_limits::RESOURCE_LIMITS_EXTENSION)
+                    .map(Vec::as_slice),
+            )
+            .unwrap_or_else(|e| {
+                error!("cannot restore resource limits: {}", e);
+                std::process::exit(2)
+            });
+        let ledger_snapshot = snapshot
+            .execution_state
+            .extensions
+            .get("ledger-v1")
+            .map(|bytes| {
+                serde_json::from_slice::<LedgerSnapshot>(bytes)
+                    .expect("execution policy validated ledger bytes")
+            });
         // The registry comes first, because it decides what every message after
         // the resume point may do. A resumed engine that rebuilt its books and
         // forgot its listings would refuse every order from the resume point on.
         // It would say only "not a listed symbol" while it did so.
-        state.mids = MidWindow::restore(snapshot.execution_state.mid_windows)
-            .unwrap_or_else(|e| { error!("cannot restore execution window: {}", e); std::process::exit(2) });
+        state.mids = MidWindow::restore(snapshot.execution_state.mid_windows).unwrap_or_else(|e| {
+            error!("cannot restore execution window: {}", e);
+            std::process::exit(2)
+        });
         state.execution_extensions = snapshot.execution_state.extensions;
         state.symbols = SymbolRegistry::from_rows(snapshot.listings);
         let counters = snapshot.counters;
@@ -1207,10 +1295,16 @@ impl MatcherState {
         }
 
         state.recent_messages = snapshot.recent.into_iter().collect();
-        // Explicit legacy state until a versioned funded snapshot is restored.
-        let mut ledger = state.ledger.snapshot();
-        ledger.last_sequence = state.last_seen;
-        state.ledger = Ledger::from_snapshot(ledger).expect("legacy synthetic snapshot");
+        if let Some(ledger) = ledger_snapshot {
+            state.restore_ledger(ledger).unwrap_or_else(|e| {
+                error!("cannot restore ledger: {}", e);
+                std::process::exit(2)
+            });
+        }
+        state.validate_resource_capacity().unwrap_or_else(|e| {
+            error!("cannot restore execution capacity: {}", e);
+            std::process::exit(2)
+        });
         state
     }
 
@@ -1233,12 +1327,17 @@ impl MatcherState {
     /// state built on purpose could then hash to a root that a different state
     /// already committed, and stopping that is the one thing this root exists
     /// for.
-    pub fn state_root(&self) -> [u8; 32] { self.state_root_for_version(5) }
+    pub fn state_root(&self) -> [u8; 32] {
+        self.state_root_for_version(5)
+    }
 
     /// Historical v4 encoding remains available to verify legacy claims.
     /// A v4 snapshot cannot resume equivalently because it omitted MidWindow.
     pub fn state_root_for_version(&self, version: u32) -> [u8; 32] {
-        assert!(version == 4 || version == 5, "unsupported state root version");
+        assert!(
+            version == 4 || version == 5,
+            "unsupported state root version"
+        );
         /// Puts one field of any length into the hash, the length first.
         fn field(hasher: &mut Sha256, bytes: &[u8]) {
             hasher.update((bytes.len() as u64).to_le_bytes());
@@ -1246,7 +1345,14 @@ impl MatcherState {
         }
 
         let mut hasher = Sha256::new();
-        field(&mut hasher, if version == 4 { b"exchange-state-v4" } else { b"exchange-state-v5" });
+        field(
+            &mut hasher,
+            if version == 4 {
+                b"exchange-state-v4"
+            } else {
+                b"exchange-state-v5"
+            },
+        );
         hasher.update(self.last_seen.to_le_bytes());
 
         // The registry decides what the engine may run, so it goes in first. Two
@@ -1385,17 +1491,47 @@ impl MatcherState {
         if version == 5 {
             let execution = self.execution_state();
             field(&mut hasher, b"execution-state-v5");
-            field(&mut hasher, &serde_json::to_vec(&execution).expect("integer execution state serializes"));
+            field(
+                &mut hasher,
+                &serde_json::to_vec(&execution).expect("integer execution state serializes"),
+            );
             hasher.update(self.trades_total.to_le_bytes());
-            field(&mut hasher, self.feed_session.as_deref().unwrap_or_default().as_bytes());
-            field(&mut hasher, self.feed_pubkey.as_deref().unwrap_or_default().as_bytes());
-            if let Some(chain) = self.feed_chain { field(&mut hasher, &chain); }
+            field(
+                &mut hasher,
+                self.feed_session.as_deref().unwrap_or_default().as_bytes(),
+            );
+            field(
+                &mut hasher,
+                self.feed_pubkey.as_deref().unwrap_or_default().as_bytes(),
+            );
+            if let Some(chain) = self.feed_chain {
+                field(&mut hasher, &chain);
+            }
         }
         hasher.finalize().into()
     }
 
     pub fn execution_state(&self) -> ExecutionState {
-        ExecutionState { root_version: 5, mid_windows: self.mids.snapshot(), extensions: self.execution_extensions.clone() }
+        let mut extensions = self.execution_extensions.clone();
+        extensions.insert("ledger-v1".into(), self.ledger_canonical_bytes());
+        if let Some(bytes) = self.resource_limits_snapshot() {
+            extensions.insert(resource_limits::RESOURCE_LIMITS_EXTENSION.into(), bytes);
+        } else {
+            extensions.remove(resource_limits::RESOURCE_LIMITS_EXTENSION);
+        }
+        ExecutionState {
+            root_version: 5,
+            mid_windows: self.mids.snapshot(),
+            extensions,
+        }
+    }
+
+    pub fn execution_genesis(&self) -> ExecutionGenesis {
+        ExecutionGenesis {
+            ledger_mode: self.ledger.mode(),
+            funding: self.ledger.config().cloned(),
+            resource_limits: self.resource_limits,
+        }
     }
     /// Integration boundary for canonical ledger/mode/funding/reservation bytes.
     pub fn set_execution_extension(&mut self, name: String, bytes: Vec<u8>) {
@@ -1485,7 +1621,9 @@ impl MatcherState {
         let session = self.feed_session.clone().unwrap_or_default();
         let execution = self.execution_state();
         let pending = self.pending.as_mut()?;
-        if !pending.is_empty() { pending.push(Change::ExecutionState(execution)); }
+        if !pending.is_empty() {
+            pending.push(Change::ExecutionState(execution));
+        }
         Some(PendingCommit {
             changes: std::mem::take(pending),
             counters,
@@ -2794,8 +2932,7 @@ pub async fn start_matcher(options: MatcherOptions) {
     start_matcher_with_ledger(options, Ledger::synthetic_legacy()).await;
 }
 
-/// Explicit simulated execution mode. Durable funded startup is fenced until
-/// the store owner connects the snapshot/root payload in the integrated build.
+/// Explicit simulated execution mode, restored from the committed snapshot.
 pub async fn start_matcher_with_ledger(options: MatcherOptions, ledger: Ledger) {
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
@@ -2814,17 +2951,15 @@ pub async fn start_matcher_with_ledger(options: MatcherOptions, ledger: Ledger) 
         public_inbox_url,
     } = options;
 
-    if ledger.is_funded() && state_db.is_some() {
-        error!(
-            "funded simulation requires --no-state-db until versioned ledger persistence is connected"
-        );
-        std::process::exit(2);
-    }
     let claim_key = load_claim_key(&state_db);
-    let (mut store, mut state) = open_state(&state_db, &feed_url, poll_ms, reset_state, &claim_key.verifying_key());
-    if ledger.is_funded() {
-        state.ledger = ledger;
-    }
+    let (mut store, mut state) = open_state(
+        &state_db,
+        &feed_url,
+        poll_ms,
+        reset_state,
+        &claim_key.verifying_key(),
+        ledger,
+    );
     info!("simulation ledger mode: {:?}", state.ledger.mode());
     state.validators_configured = validators.len();
     // The key this engine signs its execution claims with. The key sits next to
@@ -3108,16 +3243,19 @@ fn open_state(
     poll_ms: u64,
     reset_state: bool,
     trusted_key: &VerifyingKey,
+    ledger: Ledger,
 ) -> (Option<Store>, MatcherState) {
     let Some(path) = state_db else {
         warn!(
             "no state database: this engine keeps its books in memory only, \
              and a restart replays the feed from its first message"
         );
-        return (None, MatcherState::new());
+        let mut state = MatcherState::new();
+        state.ledger = ledger;
+        return (None, state);
     };
 
-    let (store, snapshot) = match Store::open(path, feed_url, poll_ms, reset_state) {
+    let (mut store, snapshot) = match Store::open(path, feed_url, poll_ms, reset_state) {
         Ok(opened) => opened,
         Err(e) => {
             error!("cannot use state database {}: {}", path.display(), e);
@@ -3139,7 +3277,8 @@ fn open_state(
     let state = match snapshot {
         Some(snapshot) => {
             if let Err(e) = Store::authenticate_snapshot(&snapshot, trusted_key) {
-                error!("cannot authenticate recovered state: {}", e); std::process::exit(2);
+                error!("cannot authenticate recovered state: {}", e);
+                std::process::exit(2);
             }
             if snapshot.feed_url != feed_url {
                 warn!(
@@ -3156,7 +3295,19 @@ fn open_state(
                 snapshot.orders.len(),
             );
             let expected_root = snapshot.last_claim_root;
-            let state = MatcherState::restore(snapshot, &store);
+            let has_ledger = snapshot
+                .execution_state
+                .extensions
+                .contains_key("ledger-v1");
+            let mut state = MatcherState::restore(snapshot, &store);
+            if !has_ledger && state.last_seen == 0 {
+                state.ledger = ledger.clone();
+            } else if state.ledger.mode() != ledger.mode()
+                || state.ledger.config() != ledger.config()
+            {
+                error!("requested ledger mode or funding differs from the committed run");
+                std::process::exit(2);
+            }
             // The rebuilt state must hash to the root the previous life
             // committed in its last claim. A database whose rows somebody
             // edited can still look correct and pass the store's row checks. It
@@ -3178,9 +3329,25 @@ fn open_state(
         }
         None => {
             info!("new run {} in {}", store.run_id(), path.display());
-            MatcherState::recording(&store)
+            let mut state = MatcherState::recording(&store);
+            state.ledger = ledger;
+            state
         }
     };
+    // Persist genesis even before the feed sends its first message. A restart
+    // cannot replace the funding policy of an empty but initialized run.
+    if state.last_seen == 0 {
+        store
+            .commit(
+                &[Change::ExecutionState(state.execution_state())],
+                &state.counters(),
+                None,
+            )
+            .unwrap_or_else(|e| {
+                error!("cannot persist execution genesis: {}", e);
+                std::process::exit(2)
+            });
+    }
     (Some(store), state)
 }
 
@@ -3293,7 +3460,9 @@ async fn poll_feed(mut poller: Poller) {
             break;
         }
 
-        if lock_state(&poller.state).execution_paused { continue; }
+        if lock_state(&poller.state).execution_paused {
+            continue;
+        }
         let since = lock_state(&poller.state).last_seen;
         // The endpoint that serves raw bytes, and not `/orders`. The chain this
         // engine builds must hash the same bytes the sequencer hashed, and this
@@ -3904,35 +4073,69 @@ impl Poller {
         let mut state = lock_state(&self.state);
         state.execution_paused = true;
         state.state_commit_failures = state.state_commit_failures.saturating_add(1);
-        error!("execution paused after persistence failure: {}. Restart after restoring storage", error);
+        error!(
+            "execution paused after persistence failure: {}. Restart after restoring storage",
+            error
+        );
     }
 
-    async fn apply_committed_batch(&mut self, messages: &[ReadMessage<OrderMessage>], head: &SignedHead) -> Result<(), BatchRejection> {
+    async fn apply_committed_batch(
+        &mut self,
+        messages: &[ReadMessage<OrderMessage>],
+        head: &SignedHead,
+    ) -> Result<(), BatchRejection> {
         let mut candidate = lock_state(&self.state).clone();
-        if candidate.execution_paused { return Ok(()); }
+        if candidate.execution_paused {
+            return Ok(());
+        }
         let trades_before = candidate.trades_total();
         apply_batch(&mut candidate, messages, head)?;
         if let Some(store) = self.store.take() {
-            let pending = candidate.take_pending().expect("durable state records changes");
+            let pending = candidate
+                .take_pending()
+                .expect("durable state records changes");
             #[cfg(not(feature = "dishonest"))]
             let root = pending.root;
             #[cfg(feature = "dishonest")]
             let root = crate::dishonest::doctor_root(pending.root);
-            let signature = logchain::sign_claim(&self.claim_key, &pending.session,
-                self.committed.last_seen + 1, pending.counters.last_seen, &self.committed_root,
-                &root, pending.trades_total);
-            let claim = ClaimRow { from_msg: self.committed.last_seen + 1, to_msg: pending.counters.last_seen,
-                root_before: self.committed_root, root_after: root, trades_total: pending.trades_total,
-                signature: Some(signature.to_bytes()) };
-            let (store, _, result) = commit_off_thread(store, pending.changes, pending.counters.clone(), Some(claim)).await;
+            let signature = logchain::sign_claim(
+                &self.claim_key,
+                &pending.session,
+                self.committed.last_seen + 1,
+                pending.counters.last_seen,
+                &self.committed_root,
+                &root,
+                pending.trades_total,
+            );
+            let claim = ClaimRow {
+                from_msg: self.committed.last_seen + 1,
+                to_msg: pending.counters.last_seen,
+                root_before: self.committed_root,
+                root_after: root,
+                trades_total: pending.trades_total,
+                signature: Some(signature.to_bytes()),
+            };
+            let (store, _, result) = commit_off_thread(
+                store,
+                pending.changes,
+                pending.counters.clone(),
+                Some(claim),
+            )
+            .await;
             self.store = Some(store);
-            if let Err(e) = result { self.pause(e); return Ok(()); }
+            if let Err(e) = result {
+                self.pause(e);
+                return Ok(());
+            }
             candidate.durable_last_seen = pending.counters.last_seen;
             self.committed = pending.counters;
             self.committed_root = root;
             self.last_heartbeat = Instant::now();
         }
-        let tick = self.live.wanted().then(|| tick_of(&candidate, trades_before, messages, STREAM_DEPTH));
+        let tick = self
+            .live
+            .wanted()
+            .then(|| tick_of(&candidate, trades_before, messages, STREAM_DEPTH));
         // Validator observations may have advanced while SQLite committed.
         let mut published = lock_state(&self.state);
         candidate.quorum_verified_at = published.quorum_verified_at;
@@ -3940,7 +4143,9 @@ impl Poller {
         candidate.validator_disputes = published.validator_disputes;
         *published = candidate;
         drop(published);
-        if let Some(tick) = tick { self.live.send(tick); }
+        if let Some(tick) = tick {
+            self.live.send(tick);
+        }
         Ok(())
     }
 
@@ -4026,7 +4231,10 @@ impl Poller {
                 state.state_commit_failures += 1;
                 state.requeue(changes);
                 state.execution_paused = true;
-                error!("state not committed: {}. Execution paused at durable cursor {}", e, state.durable_last_seen);
+                error!(
+                    "state not committed: {}. Execution paused at durable cursor {}",
+                    e, state.durable_last_seen
+                );
             }
         }
     }
@@ -4039,7 +4247,9 @@ impl Poller {
     /// this engine matched, and of the trades its CSV already published.
     async fn start_new_run(&mut self, session: Option<&str>) {
         self.commit().await;
-        if lock_state(&self.state).execution_paused { return; }
+        if lock_state(&self.state).execution_paused {
+            return;
+        }
         // The fixed key survives into the new run. The history changed, and the
         // key that signs it should not have. If the operator really replaced
         // both, --reset-state starts a run with no fixed key. The validator set
@@ -4053,27 +4263,32 @@ impl Poller {
             )
         };
         let funding_config = lock_state(&self.state).ledger.config().cloned();
+        let resource_limits = lock_state(&self.state).resource_limits;
         let mut fresh = match &mut self.store {
             Some(store) => {
                 if let Err(e) = store.start_new_run(status::FEED_RESTARTED, &self.feed_url) {
-                    self.pause(e); return;
+                    self.pause(e);
+                    return;
                 }
                 if let Some(session) = session
                     && let Err(e) = store.set_feed_session(session)
                 {
-                    self.pause(e); return;
+                    self.pause(e);
+                    return;
                 }
                 if let Some(pinned) = &pinned
                     && let Err(e) = store.set_feed_pubkey(pinned)
                 {
-                    self.pause(e); return;
+                    self.pause(e);
+                    return;
                 }
                 // The new run signs with the same key, and records that key. So
                 // the audit can check this run on its own.
                 if let Some(key) = &matcher_pubkey
                     && let Err(e) = store.set_matcher_pubkey(key)
                 {
-                    self.pause(e); return;
+                    self.pause(e);
+                    return;
                 }
                 info!("new run {} after feed restart", store.run_id());
                 MatcherState::recording(store)
@@ -4084,12 +4299,23 @@ impl Poller {
         if let Some(config) = funding_config {
             fresh.ledger = Ledger::funded(config).expect("previously validated simulated genesis");
         }
+        fresh.resource_limits = resource_limits;
         fresh.feed_pubkey = pinned;
         fresh.validators_configured = validators_configured;
         // The claim key belongs to the engine and not to one run. The same key
         // signs the new run's claims. That is what lets a reader that fixed the
         // key go on checking across a restart of the sequencer.
         fresh.matcher_pubkey = matcher_pubkey;
+        if let Some(store) = &mut self.store {
+            if let Err(e) = store.commit(
+                &[Change::ExecutionState(fresh.execution_state())],
+                &fresh.counters(),
+                None,
+            ) {
+                self.pause(e);
+                return;
+            }
+        }
         self.committed = Counters::default();
         self.committed_root = fresh.state_root();
         *lock_state(&self.state) = fresh;
@@ -4153,7 +4379,8 @@ impl Poller {
             if let Some(store) = &mut self.store
                 && let Err(e) = store.set_feed_pubkey(&head.public_key)
             {
-                self.pause(e); return false;
+                self.pause(e);
+                return false;
             }
             lock_state(&self.state).feed_pubkey = Some(head.public_key.clone());
             if self.committed.last_seen == 0 {
@@ -4204,7 +4431,8 @@ impl Poller {
         if let Some(store) = &mut self.store
             && let Err(e) = store.set_feed_session(session)
         {
-            self.pause(e); return;
+            self.pause(e);
+            return;
         }
         lock_state(&self.state).feed_session = Some(session.to_string());
         if self.committed.last_seen == 0 {
@@ -4221,7 +4449,9 @@ impl Poller {
         if let Some(store) = &mut self.store {
             match store.heartbeat() {
                 Ok(()) => self.last_heartbeat = Instant::now(),
-                Err(e) => { self.pause(e); },
+                Err(e) => {
+                    self.pause(e);
+                }
             }
         }
     }
@@ -4230,7 +4460,9 @@ impl Poller {
     /// start can tell a deliberate stop from a crash.
     async fn finish(&mut self) {
         self.commit().await;
-        if lock_state(&self.state).execution_paused { return; }
+        if lock_state(&self.state).execution_paused {
+            return;
+        }
         let Some(store) = &mut self.store else {
             return;
         };
@@ -4493,7 +4725,11 @@ async fn get_market(State(state): State<Arc<Mutex<MatcherState>>>) -> Json<Marke
         listings_ignored: state.listings_ignored,
         orders_delisted: state.orders_delisted,
         state_db: state.state_db.clone(),
-        persistence_mode: if state.state_db.is_some() { "durable" } else { "volatile" },
+        persistence_mode: if state.state_db.is_some() {
+            "durable"
+        } else {
+            "volatile"
+        },
         execution_paused: state.execution_paused,
         state_run_id: state.run_id,
         build_commit: BUILD_COMMIT,
@@ -4557,6 +4793,7 @@ struct ClaimView {
 #[derive(Serialize)]
 struct ClaimsResponse {
     root_version: u32,
+    execution_genesis: ExecutionGenesis,
     /// Which run inside the state database these claims belong to.
     run_id: i64,
     /// The history the claims are signed over. It is part of every claim's
@@ -4604,6 +4841,7 @@ struct TradeLogResponse {
 /// What the engine writes right now: the run, its session, its cursor and the
 /// keys. The engine reads all four under one lock, so they describe one moment.
 struct RunHeader {
+    execution_genesis: ExecutionGenesis,
     run_id: i64,
     session: String,
     cursor: OrderId,
@@ -4625,6 +4863,7 @@ fn run_header(state: &ApiState) -> Result<RunHeader, (StatusCode, String)> {
         ));
     };
     Ok(RunHeader {
+        execution_genesis: engine.execution_genesis(),
         run_id,
         session: engine.feed_session.clone().unwrap_or_default(),
         cursor: engine.durable_last_seen,
@@ -4944,6 +5183,7 @@ async fn get_claims(
     .await?;
     Ok(Json(ClaimsResponse {
         root_version: 5,
+        execution_genesis: header.execution_genesis,
         run_id: header.run_id,
         session: header.session,
         cursor: header.cursor,

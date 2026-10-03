@@ -1557,15 +1557,23 @@ async fn main() -> std::io::Result<()> {
         let bind = bind_addr_or_exit(&args.bind);
         let ledger = match args.ledger_mode.as_deref() {
             Some("funded-simulation") => {
-                let config = args.funding.as_ref().and_then(|path| {
-                    std::fs::read(path).map_err(|e| eprintln!("cannot read funding config: {e}"))
-                        .ok()
-                }).and_then(|bytes| {
-                    serde_json::from_slice::<services::ledger::FundingConfig>(&bytes)
-                        .map_err(|e| eprintln!("invalid funding config: {e}")).ok()
-                });
+                let config = args
+                    .funding
+                    .as_ref()
+                    .and_then(|path| {
+                        std::fs::read(path)
+                            .map_err(|e| eprintln!("cannot read funding config: {e}"))
+                            .ok()
+                    })
+                    .and_then(|bytes| {
+                        serde_json::from_slice::<services::ledger::FundingConfig>(&bytes)
+                            .map_err(|e| eprintln!("invalid funding config: {e}"))
+                            .ok()
+                    });
                 let Some(config) = config else {
-                    eprintln!("funded-simulation requires --funding JSON with explicit asset units");
+                    eprintln!(
+                        "funded-simulation requires --funding JSON with explicit asset units"
+                    );
                     std::process::exit(EXIT_CANNOT_RUN);
                 };
                 match services::ledger::Ledger::funded(config) {
@@ -1581,26 +1589,31 @@ async fn main() -> std::io::Result<()> {
                 services::ledger::Ledger::synthetic_legacy()
             }
             _ => {
-                eprintln!("--start-matcher requires --ledger-mode funded-simulation --funding JSON or --ledger-mode synthetic-legacy (without funding)");
+                eprintln!(
+                    "--start-matcher requires --ledger-mode funded-simulation --funding JSON or --ledger-mode synthetic-legacy (without funding)"
+                );
                 std::process::exit(EXIT_CANNOT_RUN);
             }
         };
-        matcher::start_matcher_with_ledger(matcher::MatcherOptions {
-            public_feed_url: args.public_feed_url.unwrap_or_else(|| feed_url.clone()),
-            // There is no fallback to a guessed address. --inbox-url is the
-            // flag the operator already writes for a separate service they run.
-            // With neither flag set, the page is told there is no separate
-            // service, instead of being pointed at a port that may hold
-            // nothing.
-            public_inbox_url: args.public_inbox_url.or(args.inbox_url),
-            feed_url,
-            bind,
-            port: args.matcher_port,
-            poll_ms: args.poll_ms,
-            state_db: (!args.no_state_db).then_some(args.state_db),
-            reset_state: args.reset_state,
-            validators: args.validators,
-        }, ledger)
+        matcher::start_matcher_with_ledger(
+            matcher::MatcherOptions {
+                public_feed_url: args.public_feed_url.unwrap_or_else(|| feed_url.clone()),
+                // There is no fallback to a guessed address. --inbox-url is the
+                // flag the operator already writes for a separate service they run.
+                // With neither flag set, the page is told there is no separate
+                // service, instead of being pointed at a port that may hold
+                // nothing.
+                public_inbox_url: args.public_inbox_url.or(args.inbox_url),
+                feed_url,
+                bind,
+                port: args.matcher_port,
+                poll_ms: args.poll_ms,
+                state_db: (!args.no_state_db).then_some(args.state_db),
+                reset_state: args.reset_state,
+                validators: args.validators,
+            },
+            ledger,
+        )
         .await;
     } else if args.start_bot || args.backtest_bot.is_some() {
         // Both paths run the same strategy. Only the source of the messages

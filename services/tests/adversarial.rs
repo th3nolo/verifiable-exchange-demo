@@ -799,8 +799,8 @@ fn run_attack(clean: &Clean, name: &str, break_it: Option<fn(&Path)>) -> (Row, S
         &dir,
         &[
             "--start-matcher".into(),
-                "--ledger-mode".into(),
-                "synthetic-legacy".into(),
+            "--ledger-mode".into(),
+            "synthetic-legacy".into(),
             "--matcher-port".into(),
             matcher_port.to_string(),
             "--feed-url".into(),

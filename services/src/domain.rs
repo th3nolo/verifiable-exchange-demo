@@ -87,7 +87,7 @@ pub const SYMBOLS: [(&str, f64, f64); 3] = [
 /// This limit bounds one fill. At the limit, quantity times price is 1e18
 /// mills, inside i64's 9.2e18. It does not bound the running totals a position
 /// keeps. `cash_mills`, `cost_basis_mills` and `net_qty_tenths` grow with every
-/// fill, and two fills at the limit are already past i64. Those totals are
+/// fill: nine fills at the limit fit in i64, ten do not. Those totals are
 /// therefore carried with checked arithmetic, see `Position::after_fill` in
 /// `matcher.rs`, and a fill that would leave the range is refused rather than
 /// wrapped round.
@@ -111,8 +111,9 @@ pub const MAX_GRID_UNITS: i64 = 1_000_000_000;
 /// The sequencer's generator only produces values this function accepts, but
 /// `POST /order` takes any positive `f64`. So a price of 100.253 or a quantity
 /// of 0.04 can arrive. Rounding those to fit would change or erase somebody's
-/// order without saying so, so they are refused instead. An order the exchange
-/// cannot hold exactly must not enter a book.
+/// order without saying so, so they are refused instead. Input is a binary
+/// float: values within 1e-6 scaled units of the integer grid are accepted
+/// and rounded to that grid. This tolerance is not exact decimal parsing.
 pub fn to_grid(value: f64, scale: f64) -> Option<i64> {
     let scaled = value * scale;
     if !scaled.is_finite() || (scaled - scaled.round()).abs() > 1e-6 {

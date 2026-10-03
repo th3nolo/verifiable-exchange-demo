@@ -7176,6 +7176,7 @@ mod tests {
             .expect("in feed order");
         let before = engine.state_root();
         let books_before = engine.books.len();
+        let chain_before = engine.feed_chain;
 
         engine
             .apply_message(&new_order_for(4, 7, Side::Sell, 100.0, 4.0))
@@ -7189,12 +7190,14 @@ mod tests {
             "a refusal left an empty book in the map"
         );
         assert_eq!(engine.books.len(), books_before);
-        // The root moves only because the cursor moved. Setting the cursor
-        // back is the way to show that nothing but the message number
-        // changed. There is no second engine here to compare against.
+        // A consumed rejection advances the cursor and authenticated history.
+        // Compare execution state at the same cursor and chain, without
+        // discarding the MidWindow now authenticated by v5.
         let after = engine.state_root();
         assert_ne!(after, before, "the cursor moved");
+        let chain_after = engine.feed_chain;
         engine.last_seen = 3;
+        engine.feed_chain = chain_before;
         assert_eq!(
             logchain::to_hex(&engine.state_root()),
             logchain::to_hex(&before),
@@ -7206,6 +7209,7 @@ mod tests {
         // because a book that did not exist holds no order of the account. So
         // an unlisted symbol is used instead.
         engine.last_seen = 4;
+        engine.feed_chain = chain_after;
         let unlisted = match new_order_for(5, 7, Side::Buy, 100.0, 5.0) {
             OrderMessage::New {
                 id,
@@ -10938,12 +10942,14 @@ mod tests {
         assert_eq!(state.orders_ignored(), 1);
         assert!(state.books.is_empty(), "no book for a symbol nobody listed");
         assert!(state.open_orders.is_empty());
-        // And the root does not carry the string either.
+        // No symbol state was created. The consumed message itself remains
+        // authenticated through the chain, so compare at the same history.
         assert_eq!(
             logchain::to_hex(&state.state_root()),
             logchain::to_hex(&{
                 let mut empty = MatcherState::new();
                 empty.last_seen = 1;
+                empty.feed_chain = state.feed_chain;
                 empty.state_root()
             })
         );

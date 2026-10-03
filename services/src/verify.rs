@@ -1467,6 +1467,7 @@ impl Replayed {
             self.self_trade.refused,
             self.order_terms.refused,
             self.order_terms.collared,
+            self.order_terms.all_or_none,
             self.rows.cash,
         ]
     }
@@ -2317,11 +2318,12 @@ mod tests {
     /// stops counting still passes all of those tests. This test names every
     /// check the second walk makes, how many rows the check read, and how many
     /// rows it failed, in one assertion. The history holds one message of most
-    /// kinds, and one order of each shape the checks answer about. So every
-    /// count below is above zero.
+    /// kinds, and one order of most shapes the checks answer about.
+    /// FOK all-or-none is zero here because this fixture has no FOK order;
+    /// dedicated order-term fixtures exercise that check.
     ///
     /// The list used to hold the five checks the book replay made. It holds
-    /// all seventeen now, because the checks that read a trade row against two
+    /// all eighteen now, because the checks that read a trade row against two
     /// published orders moved into the same walk when the trade record stopped
     /// being read into memory. Those counts are what says the move changed
     /// what the checker reports about nothing.
@@ -2432,6 +2434,11 @@ mod tests {
                 ("no fill against the taker's own resting order", 11, 1),
                 ("no fill for an order the rules refuse", 1, 1),
                 ("every market order filled inside its collar", 2, 1),
+                (
+                    "every fill-or-kill order filled completely or not at all",
+                    0,
+                    0
+                ),
                 // The two wrong rows above move money, and three accounts end
                 // holding a total the sequencer's own orders do not produce.
                 ("cash matches the prices the feed published", 6, 3),

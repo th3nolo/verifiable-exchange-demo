@@ -53,6 +53,10 @@ pub(super) struct BookAndTrades<'a> {
     /// The book of the symbol being matched. Its levels are keyed by price in
     /// cents; each level is a queue, oldest first.
     pub(super) book: &'a mut Book,
+    pub(super) ledger: &'a mut crate::ledger::Ledger,
+    /// The complete FOK ledger plan is already committed. Do not settle twice
+    /// or introduce fallible monetary arithmetic while applying that plan.
+    pub(super) ledger_plan_committed: bool,
     /// Where an open order lives, so a cancel can find it without scanning the
     /// book. A resting order that fills completely comes out of this map.
     pub(super) open_orders: &'a mut HashMap<OrderId, OrderRef>,
@@ -327,6 +331,14 @@ pub(super) fn execute(order: &IncomingOrder, into: &mut BookAndTrades<'_>) -> Ma
                 remaining_tenths: remaining,
             };
         };
+        into.ledger
+            .settle_fill(
+                fill.maker_order,
+                order.id,
+                fill.price_cents,
+                fill.qty_tenths,
+            )
+            .expect("complete funded command preflight accepted each actual fill");
         commit_fill(order, fill, maker_next, taker_next, trade_id, into);
         remaining -= fill.qty_tenths;
     }
@@ -346,6 +358,10 @@ fn commit_fill(
     trade_id: u64,
     into: &mut BookAndTrades<'_>,
 ) {
+    debug_assert!(
+        order.time_in_force != crate::domain::TimeInForce::FillOrKill || into.ledger_plan_committed,
+        "FOK settlement must be staged before the first execution effect"
+    );
     let levels = match order.side {
         Side::Buy => &mut into.book.asks,
         Side::Sell => &mut into.book.bids,

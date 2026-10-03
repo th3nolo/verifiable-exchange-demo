@@ -87,6 +87,10 @@ file does not.
 
 ### Starting the exchange
 
+- `--ledger-mode`: Required with `--start-matcher`: `funded-simulation`
+  requires `--funding JSON`; `synthetic-legacy` retains unfunded PnL semantics.
+  [Simulation units and GET /balances](SPOT-SIMULATION.md) describe funding
+  and available/reserved assets.
 - `--start-matcher`: Starts the exchange. It reads the sequencer's messages.
   It matches crossing orders by price, then by time. It serves the trading UI
   and the market state on `http://127.0.0.1:3001` by default. It commits a
@@ -929,7 +933,7 @@ services --start-feed  --ui-origin https://exchange.example.com
 services --start-inbox --ui-origin https://exchange.example.com
 
 # matcher: where the browser should send it, by either route
-services --start-matcher --feed-url http://127.0.0.1:3000 \
+services --start-matcher --ledger-mode synthetic-legacy --feed-url http://127.0.0.1:3000 \
   --public-feed-url https://exchange.example.com/feed \
   --public-inbox-url https://exchange.example.com/inbox
 ```
@@ -2220,7 +2224,7 @@ its own port flag:
 
 ```bash
 services --start-feed      --bind 0.0.0.0 --feed-port 3000
-services --start-matcher   --bind 0.0.0.0 --matcher-port 3001
+services --start-matcher --ledger-mode synthetic-legacy --bind 0.0.0.0 --matcher-port 3001
 services --start-inbox     --bind 0.0.0.0 --inbox-port 3002
 services --start-validator --bind 0.0.0.0 --validator-port 3010
 ```

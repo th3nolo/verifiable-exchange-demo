@@ -1,0 +1,14 @@
+{
+  "markets": [
+    {"symbol": "ETH-USDC", "base_asset": "ETH", "quote_asset": "USDC"},
+    {"symbol": "BTC-USDC", "base_asset": "BTC", "quote_asset": "USDC"},
+    {"symbol": "MERKLE-USDC", "base_asset": "MERKLE", "quote_asset": "USDC"}
+  ],
+  "funding": [
+    {"account": 1, "asset": "USDC", "units": 10000000},
+    {"account": 2, "asset": "ETH", "units": 10000},
+    {"account": 2, "asset": "BTC", "units": 1000},
+    {"account": 2, "asset": "MERKLE", "units": 100000}
+  ],
+  "fee_units": 0
+}

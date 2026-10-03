@@ -2839,6 +2839,7 @@ mod tests {
         // The matching engine the exchange ran. It knows which log it is on,
         // so it can check who signed the listing that starts the history.
         let mut engine = MatcherState::replaying(SESSION);
+        engine.set_replay_feed_key(Some(logchain::to_hex(feed_key.verifying_key().as_bytes())));
         let mut root_before = engine.state_root();
         let mut chain = logchain::EMPTY_CHAIN;
         let mut written = 0u64;
@@ -3817,6 +3818,7 @@ mod tests {
         // history, and one row for each fill, taken as the matching engine
         // produces them.
         let mut engine = MatcherState::replaying(SESSION);
+        engine.set_replay_feed_key(Some(logchain::to_hex(key.verifying_key().as_bytes())));
         let root_before = engine.state_root();
         let mut recorded: Vec<DbTrade> = Vec::new();
         for msg in &messages {
@@ -4184,9 +4186,10 @@ mod tests {
     /// state root the matching engine had after it applied them. This function
     /// computes both the long way. So a test that passes says the audit agrees
     /// with the definition, and not with itself.
-    fn anchor_over(messages: &[OrderMessage], at: OrderId, session: &str, index: u64) -> Anchor {
+    fn anchor_over(messages: &[OrderMessage], at: OrderId, session: &str, index: u64, feed_key: &SigningKey) -> Anchor {
         let mut chain = logchain::EMPTY_CHAIN;
         let mut engine = MatcherState::replaying(session);
+        engine.set_replay_feed_key(Some(logchain::to_hex(feed_key.verifying_key().as_bytes())));
         for msg in messages.iter().take_while(|m| m.id() <= at) {
             chain = logchain::extend(&chain, msg);
             engine.apply_message(msg).expect("apply");
@@ -4219,12 +4222,12 @@ mod tests {
 
     /// The anchors that an anchor sender which writes every `every` messages
     /// would have left while the sequencer published this history.
-    fn anchors_every(messages: &[OrderMessage], every: OrderId, session: &str) -> Vec<Anchor> {
+    fn anchors_every(messages: &[OrderMessage], every: OrderId, session: &str, feed_key: &SigningKey) -> Vec<Anchor> {
         (1..)
             .map(|n| n * every)
             .take_while(|at| *at <= messages.len() as OrderId)
             .enumerate()
-            .map(|(i, at)| anchor_over(messages, at, session, i as u64 + 1))
+            .map(|(i, at)| anchor_over(messages, at, session, i as u64 + 1, feed_key))
             .collect()
     }
 
@@ -4252,7 +4255,7 @@ mod tests {
 
         // An anchor sender that wrote every 8 messages. That is what a sender
         // on a timer produces: several anchors, and none of them at the end.
-        let anchors = anchors_of(anchors_every(&messages, 8, SESSION));
+        let anchors = anchors_of(anchors_every(&messages, 8, SESSION, &key));
         let outcome =
             check_held_anchored(&record, &head, Some(SESSION), &messages, Some(&anchors)).await;
 
@@ -4296,8 +4299,8 @@ mod tests {
 
         // What the contract holds: three anchors over the history as it was,
         // and a fourth written after the rewind.
-        let mut written = anchors_every(&original, 10, SESSION);
-        written.push(anchor_over(&replayed, 40, SESSION, 4));
+        let mut written = anchors_every(&original, 10, SESSION, &key);
+        written.push(anchor_over(&replayed, 40, SESSION, 4, &key));
         let anchors = anchors_of(written);
 
         let path = build(&dir, &replayed, &key);
@@ -4306,7 +4309,7 @@ mod tests {
 
         // The newest anchor on its own agrees with what is served today, which
         // is the whole reason this test exists.
-        let newest = anchors_of(vec![anchor_over(&replayed, 40, SESSION, 1)]);
+        let newest = anchors_of(vec![anchor_over(&replayed, 40, SESSION, 1, &key)]);
         assert!(
             check_held_anchored(&record, &head, Some(SESSION), &replayed, Some(&newest))
                 .await
@@ -4342,7 +4345,7 @@ mod tests {
         let record = read_db(&path, None).expect("read");
         let head = Ok(signed_head(&key, SESSION, &messages));
 
-        let mut anchors = anchors_of(anchors_every(&messages, 8, SESSION)).expect("built");
+        let mut anchors = anchors_of(anchors_every(&messages, 8, SESSION, &key)).expect("built");
         anchors.total = 400;
         anchors.complete = false;
         let anchors = Ok(anchors);
@@ -4370,7 +4373,7 @@ mod tests {
 
         // What was anchored: the history as it stood.
         let original = history(40);
-        let anchors = anchors_of(vec![anchor_over(&original, 25, SESSION, 4)]);
+        let anchors = anchors_of(vec![anchor_over(&original, 25, SESSION, 4, &key)]);
 
         // What is served now: the same length, the same session, the same
         // keys, and one message different. Everything is signed again over the
@@ -4433,6 +4436,7 @@ mod tests {
             25,
             "a-history-that-was-thrown-away",
             4,
+            &key,
         )]);
         let outcome =
             check_held_anchored(&record, &head, Some(SESSION), &messages, Some(&anchors)).await;
@@ -4478,7 +4482,7 @@ mod tests {
         let record = read_db(&path, None).expect("read");
         let head = Ok(signed_head(&key, SESSION, &messages));
 
-        let anchors = anchors_of(vec![anchor_over(&messages, 30, SESSION, 4)]);
+        let anchors = anchors_of(vec![anchor_over(&messages, 30, SESSION, 4, &key)]);
         let outcome =
             check_held_anchored(&record, &head, Some(SESSION), &messages, Some(&anchors)).await;
 

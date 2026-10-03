@@ -5,6 +5,26 @@ use services::{
     store::{Change, ClaimRow, Counters, ExecutionState, Store, StoreError},
 };
 
+#[test]
+fn unknown_root_version_is_rejected_even_on_an_empty_run() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("state.db");
+    let (mut store, _) = Store::open(&path, "http://local", 200, false).unwrap();
+    store.close_stopped().unwrap();
+    drop(store);
+    let conn = Connection::open(&path).unwrap();
+    conn.execute("UPDATE resume_point SET root_version=99", [])
+        .unwrap();
+    let error = Store::open(&path, "http://local", 200, false)
+        .err()
+        .unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported execution root version 99")
+    );
+}
+
 fn commit(store: &mut Store, id: u64, key: &SigningKey) {
     let root = [id as u8; 32];
     let claim = ClaimRow {

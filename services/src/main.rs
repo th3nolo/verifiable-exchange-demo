@@ -698,6 +698,10 @@ struct Args {
     #[arg(long, default_value_t = 6.0)]
     stdio_messages_per_second: f64,
 
+    /// Maximum bytes in one stdio input line, including its newline.
+    #[arg(long, default_value_t = 1024 * 1024)]
+    stdio_max_line_bytes: usize,
+
     /// SQLite file the exchange keeps its state in. On start the exchange
     /// continues the run this file was left in, whether the last process
     /// stopped or crashed.
@@ -731,6 +735,10 @@ struct Args {
     /// memory only, and a restart loses every published message.
     #[arg(long)]
     no_feed_db: bool,
+
+    /// JSON file with positive feed retention/admission limits.
+    #[arg(long)]
+    feed_retention_limits: Option<PathBuf>,
 
     /// Starts the separate service: it records orders, and the sequencer does
     /// not control it. The sequencer empties it on every tick. An entry the
@@ -1510,7 +1518,30 @@ async fn main() -> std::io::Result<()> {
         let trusted_proxies = trusted_proxies_or_exit(&args.trusted_proxy);
         let bind = bind_addr_or_exit(&args.bind);
         let operator_key = operator_public_key_or_exit(args.operator_key.as_deref());
-        feed::start_feed(
+        let limits = match args.feed_retention_limits {
+            Some(path) => {
+                let loaded = std::fs::read(&path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|bytes| {
+                        serde_json::from_slice::<feed::RetentionLimits>(&bytes)
+                            .map_err(|e| e.to_string())
+                    })
+                    .and_then(|limits| limits.validate().map(|()| limits));
+                match loaded {
+                    Ok(limits) => limits,
+                    Err(detail) => {
+                        eprintln!(
+                            "cannot use feed retention limits {}: {}",
+                            path.display(),
+                            detail
+                        );
+                        std::process::exit(EXIT_CANNOT_RUN);
+                    }
+                }
+            }
+            None => feed::RetentionLimits::default(),
+        };
+        feed::start_feed_with_retention_limits(
             bind,
             args.feed_port,
             args.num_accounts,
@@ -1520,6 +1551,7 @@ async fn main() -> std::io::Result<()> {
             ui_origins,
             trusted_proxies,
             operator_key,
+            limits,
         )
         .await;
     } else if args.start_inbox {
@@ -1821,7 +1853,10 @@ async fn main() -> std::io::Result<()> {
         // market-harness stdio protocol, so a suite this repository did not
         // write can score this exchange. Standard output carries events and
         // nothing else, so every message to a person goes to standard error.
-        if let Err(e) = stdio_engine::run(args.stdio_messages_per_second) {
+        if let Err(e) = stdio_engine::run_with_max_line_bytes(
+            args.stdio_messages_per_second,
+            args.stdio_max_line_bytes,
+        ) {
             eprintln!("the stdio engine stopped: {}", e);
             std::process::exit(EXIT_CANNOT_RUN);
         }

@@ -379,9 +379,24 @@ otherwise will write the wrong thing.
 **Fill-or-kill is not step 6.** A fill-or-kill order must fill in whole or not
 at all. By the time step 6 is asked, step 5 has booked the fills, moved both
 positions and written the trade rows. There is nothing left to kill.
-Fill-or-kill must be decided **before** step 5: ask the book whether the whole
-quantity is available, and refuse in step 2. Only good-till-cancel and
-immediate-or-cancel belong in step 6.
+Fill-or-kill must be decided **before** any execution effect. Step 2 checks
+liquidity. After price bounds and self-trade checks, step 5 stages the entire
+price-time fill plan and every cumulative position transition. Repeated
+accounts and both legs of self-matches read the preceding staged result.
+Any overflow rejects the complete order. Settlement validators consume that
+same immutable fill slice before commit; they may reject it without modifying
+the book, positions or trades. Commit consumes the staged fills directly.
+Only good-till-cancel and immediate-or-cancel belong in step 6.
+
+Core prices are cents, quantities are tenths and their product is quote mills
+(1/1000 quote unit). Authoritative position arithmetic is checked. Proportional
+basis on a partial close truncates toward zero to whole mills; the remainder
+stays with the open position and is consumed on a full close. Cash deltas are
+integer products and do not round. The JSON wire still uses binary `f64` and
+accepts a 1e-6 scaled-unit grid tolerance; it does not promise exact decimal
+parsing. Presentation totals may saturate and are not settlement balances.
+The independent checker requires every FOK to have zero fills or exactly its
+requested integer quantity, regardless of the initially available liquidity.
 
 **Step 6 changes the book through its answer, and not by hand.** It returns
 rest or cancel, and the caller acts. If step 6 rested the order itself, today's

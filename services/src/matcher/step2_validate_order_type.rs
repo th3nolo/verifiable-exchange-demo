@@ -158,7 +158,10 @@ fn crossing_tenths(book: Option<&Book>, side: Side, limit_cents: i64) -> i64 {
     levels
         .flat_map(|(_, level)| level.iter())
         .map(|resting| resting.qty_tenths)
-        .sum()
+        // Admission asks only whether quantity suffices. Capping this positive
+        // sum at i64::MAX preserves that answer for every valid incoming size
+        // without overflowing a book-wide total.
+        .fold(0i64, i64::saturating_add)
 }
 
 #[cfg(test)]
@@ -209,6 +212,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn liquidity_sufficiency_does_not_overflow_a_large_book_total() {
+        // Internal extreme fixture: admission needs a threshold answer, not
+        // an unbounded exact book-wide quantity. No overflow may wrap to zero.
+        let mut asks = book_with(Side::Sell, 10_000, i64::MAX);
+        asks.asks.get_mut(&10_000).unwrap().push_back(RestingOrder {
+            id: 2,
+            account: 8,
+            qty_tenths: 1,
+        });
+        assert_eq!(crossing_tenths(Some(&asks), Side::Buy, 10_000), i64::MAX);
+        let incoming = order(
+            Side::Buy,
+            10_000,
+            1,
+            OrderType::Limit,
+            TimeInForce::FillOrKill,
+            false,
+        );
+        assert!(validate(&incoming, Some(&asks)).is_ok());
+    }
     fn plain(side: Side, limit_cents: i64, qty_tenths: i64) -> IncomingOrder {
         order(
             side,

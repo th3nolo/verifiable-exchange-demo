@@ -148,7 +148,7 @@ fn recovery_root_authenticates_reference_and_canonical_extensions() {
     reordered.set_execution_extension("a".into(), vec![1]);
     reordered.set_execution_extension("z".into(), vec![2]);
     assert_eq!(state.state_root(), reordered.state_root());
-    reordered.set_execution_extension("ledger-v1".into(), vec![3]);
+    reordered.set_execution_extension("another-policy-v1".into(), vec![3]);
     assert_ne!(state.state_root(), reordered.state_root());
 }
 

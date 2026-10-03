@@ -1,7 +1,7 @@
 # Exchange services
 
 The matcher requires an explicit simulation mode. Use `--ledger-mode
-funded-simulation --funding funding.example.json --no-state-db` for financed
+funded-simulation --funding funding.example.json --state-db state.db` for financed
 spot balances, or `--ledger-mode synthetic-legacy` for the original PnL demo.
 See [funding, units and balance API](../docs/SPOT-SIMULATION.md). No mode moves
 real funds or provides custody.

@@ -284,8 +284,8 @@ async fn history(client: &Client, sequencer: &Service) -> Vec<wire::RawMessage> 
 /// Runs `docker/open-the-log.sh` exactly as the entrypoint runs it.
 fn open_the_log(dir: &Path, feed_url: &str, matcher_url: &str) -> std::process::Output {
     Command::new("bash")
-        .arg(OPEN_THE_LOG)
-        .arg(env!("CARGO_BIN_EXE_services"))
+        .arg(OPEN_THE_LOG.replace('\\', "/"))
+        .arg(env!("CARGO_BIN_EXE_services").replace('\\', "/"))
         .arg(feed_url)
         .arg(matcher_url)
         .arg("operator.key")
